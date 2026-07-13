@@ -1,0 +1,82 @@
+{
+  "name": "ai-sdk-provider-grok-build",
+  "version": "0.1.0",
+  "description": "AI SDK v7 provider for the xAI Grok Build CLI over ACP",
+  "keywords": [
+    "ai-sdk",
+    "grok-build",
+    "grok",
+    "xai",
+    "acp",
+    "cli",
+    "language-model",
+    "provider"
+  ],
+  "homepage": "https://github.com/ben-vargas/ai-sdk-provider-grok-build",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ben-vargas/ai-sdk-provider-grok-build.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ben-vargas/ai-sdk-provider-grok-build/issues"
+  },
+  "license": "MIT",
+  "author": "Ben Vargas",
+  "type": "module",
+  "sideEffects": false,
+  "types": "./dist/index.d.ts",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/**/*",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "clean": "rm -rf dist",
+    "dev": "tsup --watch",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run clean && npm run build",
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --check .",
+    "format:fix": "prettier --write .",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "test": "vitest run --configLoader runner",
+    "test:watch": "vitest --configLoader runner",
+    "test:coverage": "vitest run --coverage --configLoader runner",
+    "validate": "npm run build && npm run typecheck && npm run format && npm run lint && npm run test"
+  },
+  "dependencies": {
+    "@ai-sdk/provider": "^4.0.2",
+    "@ai-sdk/provider-utils": "^5.0.5"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.28.0",
+    "@types/node": "^22.10.0",
+    "@vitest/coverage-v8": "^3.2.4",
+    "eslint": "^9.28.0",
+    "globals": "^16.2.0",
+    "prettier": "^3.6.2",
+    "tsup": "8.5.1",
+    "typescript": "5.6.3",
+    "typescript-eslint": "^8.34.0",
+    "vitest": "^3.2.4"
+  },
+  "peerDependencies": {
+    "ai": "^7.0.16",
+    "zod": "^4"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
