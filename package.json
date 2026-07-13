@@ -88,5 +88,8 @@
   "publishConfig": {
     "access": "public",
     "tag": "ai-sdk-v6"
+  },
+  "overrides": {
+    "esbuild": "^0.28.1"
   }
 }
