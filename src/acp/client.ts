@@ -45,6 +45,9 @@ import type {
 const DEFAULT_ARGS = ["--no-auto-update", "agent", "stdio"];
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_STDERR_LIMIT = 32_768;
+const CANCEL_GRACE_MS = 250;
+const TERMINATE_GRACE_MS = 500;
+const KILL_GRACE_MS = 250;
 
 export type PermissionMode = "default" | "bypassPermissions";
 
@@ -230,6 +233,7 @@ export class AcpClient {
     string,
     Set<(update: AcpSessionUpdateParams) => void | Promise<void>>
   >();
+  private readonly activeSessions = new Set<string>();
   private readonly pendingPermissions = new Map<JsonRpcId, PendingPermission>();
   private writeQueue: Promise<void> = Promise.resolve();
   private readQueue: Promise<void> = Promise.resolve();
@@ -237,6 +241,13 @@ export class AcpClient {
   private initialized?: AcpInitializeResult;
   private stderr = "";
   private lastFailure?: Error;
+  private exitPromise?: Promise<void>;
+  private resolveExit?: () => void;
+  private stdoutEndPromise?: Promise<void>;
+  private childExited = false;
+  private shutdownRequested = false;
+  private cancellationRequested = false;
+  private disposePromise?: Promise<void>;
 
   constructor(options: AcpClientOptions = {}) {
     this.executable = options.executable ?? "grok";
@@ -279,11 +290,12 @@ export class AcpClient {
     };
   }
 
-  async initialize(): Promise<AcpInitializeResult> {
+  async initialize(signal?: AbortSignal): Promise<AcpInitializeResult> {
+    if (signal?.aborted) throw abortReason(signal);
     if (this.initialized) return this.initialized;
     if (this.initializePromise) return await this.initializePromise;
 
-    this.initializePromise = this.initializeInternal()
+    this.initializePromise = this.initializeInternal(signal)
       .catch((error: unknown) => {
         this.fail(error);
         throw error;
@@ -296,12 +308,32 @@ export class AcpClient {
 
   async authenticate(
     methodId = this.authMethod,
+    signal?: AbortSignal,
   ): Promise<AcpAuthenticateResult> {
     if (methodId === false) return {};
-    this.start();
+    const initialized = await this.initialize(signal);
+    const advertised = initialized.authMethods.some(
+      (method) => method.id === methodId,
+    );
+    if (!advertised) {
+      throw new AcpAuthenticationError(
+        `Grok did not advertise authentication method '${methodId}'. Available methods: ${initialized.authMethods.map((method) => method.id).join(", ") || "(none)"}.`,
+        { stderr: this.stderr, code: "AUTH_METHOD_NOT_AVAILABLE" },
+      );
+    }
     try {
-      return await this.requestInternal("authenticate", { methodId });
+      return await this.requestInternal(
+        "authenticate",
+        { methodId },
+        this.requestTimeoutMs,
+        signal,
+      );
     } catch (error) {
+      if (
+        signal?.aborted ||
+        (error instanceof Error && error.name === "AbortError")
+      )
+        throw error;
       throw new AcpAuthenticationError(
         `Grok authentication with method '${methodId}' failed. Run 'grok login' to refresh the cached CLI login, or configure XAI_API_KEY as an alternative.`,
         { cause: error, stderr: this.stderr, code: "AUTHENTICATION_FAILED" },
@@ -313,22 +345,32 @@ export class AcpClient {
     method: Method,
     params: AcpRequestMap[Method]["params"],
     timeoutMs?: number,
+    signal?: AbortSignal,
   ): Promise<AcpRequestMap[Method]["result"]> {
-    await this.initialize();
-    return await this.requestInternal(method, params, timeoutMs);
+    await this.initialize(signal);
+    return await this.requestInternal(method, params, timeoutMs, signal);
   }
 
   async notify<Method extends keyof AcpNotificationMap>(
     method: Method,
     params: AcpNotificationMap[Method],
+    signal?: AbortSignal,
   ): Promise<void> {
-    await this.initialize();
+    await this.initialize(signal);
+    if (signal?.aborted) throw abortReason(signal);
     await this.writeMessage({ jsonrpc: "2.0", method, params });
   }
 
-  async newSession(params: AcpNewSessionParams): Promise<AcpSessionResult> {
+  async newSession(
+    params: AcpNewSessionParams,
+    signal?: AbortSignal,
+  ): Promise<AcpSessionResult> {
     try {
-      return await this.request("session/new", params);
+      return await this.requestSessionWithAuthenticationRetry(
+        "session/new",
+        params,
+        signal,
+      );
     } catch (error) {
       if (isAuthenticationRpcError(error)) {
         throw new AcpAuthenticationError(
@@ -342,8 +384,9 @@ export class AcpClient {
 
   async loadSession(
     params: AcpLoadSessionParams,
+    signal?: AbortSignal,
   ): Promise<AcpLoadSessionResult> {
-    const initialized = await this.initialize();
+    const initialized = await this.initialize(signal);
     if (!initialized.agentCapabilities.loadSession) {
       throw new AcpProtocolError(
         "Grok did not advertise the ACP 'loadSession' capability.",
@@ -352,18 +395,23 @@ export class AcpClient {
         },
       );
     }
-    return await this.requestInternal("session/load", params);
+    return await this.requestSessionWithAuthenticationRetry(
+      "session/load",
+      params,
+      signal,
+    );
   }
 
   async prompt(
     params: AcpPromptParams,
     options: AcpPromptOptions = {},
   ): Promise<AcpPromptOutcome> {
-    await this.initialize();
+    await this.initialize(options.signal);
     const signal = options.signal;
     if (signal?.aborted) throw abortReason(signal);
 
     const handler = options.onUpdate;
+    this.activeSessions.add(params.sessionId);
     if (handler) {
       const handlers = this.promptHandlers.get(params.sessionId) ?? new Set();
       handlers.add(handler);
@@ -384,6 +432,7 @@ export class AcpClient {
       );
       return { stopReason: result.stopReason, meta: result._meta };
     } finally {
+      this.activeSessions.delete(params.sessionId);
       signal?.removeEventListener("abort", onAbort);
       if (handler) {
         const handlers = this.promptHandlers.get(params.sessionId);
@@ -394,46 +443,47 @@ export class AcpClient {
   }
 
   async cancelSession(sessionId: string): Promise<void> {
+    this.cancellationRequested = true;
     for (const permission of this.pendingPermissions.values()) {
       if (permission.sessionId === sessionId) permission.cancel();
     }
     await this.notify("session/cancel", { sessionId });
   }
 
-  dispose(): void {
-    if (this.state === "disposed") return;
-    this.state = "disposed";
-    const error = new AcpError("AcpClient was disposed.", {
-      code: "CLIENT_DISPOSED",
-    });
-    this.rejectAll(error);
-    this.pendingPermissions.forEach((permission) => permission.cancel());
-    this.pendingPermissions.clear();
-    this.child?.kill("SIGTERM");
+  async dispose(): Promise<void> {
+    this.disposePromise ??= this.disposeInternal();
+    await this.disposePromise;
   }
 
   async [Symbol.asyncDispose](): Promise<void> {
-    this.dispose();
+    await this.dispose();
   }
 
-  private async initializeInternal(): Promise<AcpInitializeResult> {
+  private async initializeInternal(
+    signal?: AbortSignal,
+  ): Promise<AcpInitializeResult> {
     this.start();
-    const result = await this.requestInternal("initialize", {
-      protocolVersion: 1,
-      clientCapabilities: {
-        fs: {
-          readTextFile:
-            (this.fileSystem.readTextFile !== undefined &&
-              this.fileSystem.readTextFile !== false) ||
-            this.requestHandlers.has("fs/read_text_file"),
-          writeTextFile:
-            (this.fileSystem.writeTextFile !== undefined &&
-              this.fileSystem.writeTextFile !== false) ||
-            this.requestHandlers.has("fs/write_text_file"),
+    const result = await this.requestInternal(
+      "initialize",
+      {
+        protocolVersion: 1,
+        clientCapabilities: {
+          fs: {
+            readTextFile:
+              (this.fileSystem.readTextFile !== undefined &&
+                this.fileSystem.readTextFile !== false) ||
+              this.requestHandlers.has("fs/read_text_file"),
+            writeTextFile:
+              (this.fileSystem.writeTextFile !== undefined &&
+                this.fileSystem.writeTextFile !== false) ||
+              this.requestHandlers.has("fs/write_text_file"),
+          },
+          terminal: false,
         },
-        terminal: false,
       },
-    });
+      this.requestTimeoutMs,
+      signal,
+    );
 
     if (result.protocolVersion !== 1) {
       throw new AcpProtocolError(
@@ -442,24 +492,123 @@ export class AcpClient {
       );
     }
 
-    if (this.authMethod !== false) {
-      const advertised = result.authMethods.some(
-        (method) => method.id === this.authMethod,
-      );
-      if (!advertised) {
-        throw new AcpAuthenticationError(
-          `Grok did not advertise authentication method '${this.authMethod}'. Available methods: ${result.authMethods.map((method) => method.id).join(", ") || "(none)"}.`,
-          { stderr: this.stderr, code: "AUTH_METHOD_NOT_AVAILABLE" },
-        );
-      }
-      await this.authenticate(this.authMethod);
-    }
-
     this.initialized = result;
     return result;
   }
 
+  private async requestSessionWithAuthenticationRetry<
+    Method extends "session/new" | "session/load",
+  >(
+    method: Method,
+    params: AcpRequestMap[Method]["params"],
+    signal?: AbortSignal,
+  ): Promise<AcpRequestMap[Method]["result"]> {
+    await this.initialize(signal);
+    try {
+      return await this.requestInternal(
+        method,
+        params,
+        this.requestTimeoutMs,
+        signal,
+      );
+    } catch (error) {
+      if (!isAuthenticationRpcError(error) || this.authMethod === false)
+        throw error;
+      await this.authenticate(this.authMethod, signal);
+      return await this.requestInternal(
+        method,
+        params,
+        this.requestTimeoutMs,
+        signal,
+      );
+    }
+  }
+
+  private async disposeInternal(): Promise<void> {
+    if (this.state === "disposed") return;
+    const disposalError = new AcpError("AcpClient was disposed.", {
+      code: "CLIENT_DISPOSED",
+    });
+    if (this.state === "idle") {
+      this.state = "disposed";
+      this.rejectAll(disposalError);
+      return;
+    }
+    if (
+      this.state === "exited" &&
+      this.lastFailure instanceof AcpSpawnError &&
+      this.lastFailure.code === "ENOENT"
+    ) {
+      this.state = "disposed";
+      this.rejectAll(disposalError);
+      return;
+    }
+
+    this.shutdownRequested = true;
+    if (this.state === "running") {
+      const sessionIds = [...this.activeSessions];
+      await Promise.allSettled(
+        sessionIds.map(async (sessionId) => {
+          await this.writeMessage({
+            jsonrpc: "2.0",
+            method: "session/cancel",
+            params: { sessionId },
+          });
+        }),
+      );
+      if (
+        (sessionIds.length > 0 || this.cancellationRequested) &&
+        !this.childExited
+      ) {
+        await this.waitForExit(CANCEL_GRACE_MS);
+      }
+    }
+
+    if (!this.childExited) {
+      this.child?.kill("SIGTERM");
+      await this.waitForExit(TERMINATE_GRACE_MS);
+    }
+    if (!this.childExited) {
+      this.child?.kill("SIGKILL");
+      await this.waitForExit(KILL_GRACE_MS);
+    }
+
+    this.state = "disposed";
+    this.rejectAll(disposalError);
+    this.activeSessions.clear();
+    this.pendingPermissions.forEach((permission) => permission.cancel());
+    this.pendingPermissions.clear();
+  }
+
+  private async waitForExit(timeoutMs: number): Promise<boolean> {
+    if (this.childExited || !this.exitPromise) return true;
+    let timer: NodeJS.Timeout | undefined;
+    const timedOut = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), timeoutMs);
+    });
+    const exited = await Promise.race([
+      this.exitPromise.then(() => true as const),
+      timedOut,
+    ]);
+    if (timer) clearTimeout(timer);
+    return exited;
+  }
+
+  private async terminateAfterFailure(): Promise<void> {
+    if (this.childExited || !this.child) return;
+    this.child.kill("SIGTERM");
+    if (!(await this.waitForExit(TERMINATE_GRACE_MS))) {
+      this.child.kill("SIGKILL");
+      await this.waitForExit(KILL_GRACE_MS);
+    }
+  }
+
   private start(): void {
+    if (this.shutdownRequested) {
+      throw new AcpError("Cannot use a disposing AcpClient.", {
+        code: "CLIENT_DISPOSED",
+      });
+    }
     if (this.state === "running") return;
     if (this.state === "disposed") {
       throw new AcpError("Cannot start a disposed AcpClient.", {
@@ -482,6 +631,14 @@ export class AcpClient {
       throw this.createSpawnError(error);
     }
     this.state = "running";
+    this.childExited = false;
+    this.exitPromise = new Promise((resolve) => {
+      this.resolveExit = resolve;
+    });
+    let resolveStdoutEnd: (() => void) | undefined;
+    this.stdoutEndPromise = new Promise((resolve) => {
+      resolveStdoutEnd = resolve;
+    });
 
     const framer = new NdjsonFramer((line) => {
       this.readQueue = this.readQueue
@@ -491,15 +648,41 @@ export class AcpClient {
     this.child.stdout.on("data", (chunk: Buffer | string) =>
       framer.push(chunk),
     );
-    this.child.stdout.on("end", () => framer.end());
+    this.child.stdout.on("end", () => {
+      framer.end();
+      resolveStdoutEnd?.();
+    });
     this.child.stderr.on("data", (chunk: Buffer | string) =>
       this.captureStderr(chunk),
     );
     this.child.on("error", (error) => this.fail(this.createSpawnError(error)));
     this.child.on("exit", (code, signal) => {
-      if (this.state === "disposed") return;
-      this.fail(new AcpProcessExitError(code, signal, { stderr: this.stderr }));
+      this.childExited = true;
+      this.resolveExit?.();
+      void this.handleProcessExit(code, signal);
     });
+  }
+
+  private async handleProcessExit(
+    code: number | null,
+    signal: NodeJS.Signals | null,
+  ): Promise<void> {
+    await this.stdoutEndPromise;
+    await this.readQueue;
+    if (
+      this.state === "disposed" ||
+      this.state === "exited" ||
+      this.shutdownRequested
+    )
+      return;
+    const error = new AcpProcessExitError(code, signal, {
+      stderr: this.stderr,
+    });
+    this.lastFailure = error;
+    this.state = "exited";
+    if (this.pending.size > 0) this.rejectAll(error);
+    this.pendingPermissions.forEach((permission) => permission.cancel());
+    this.pendingPermissions.clear();
   }
 
   private createSpawnError(error: unknown): AcpSpawnError {
@@ -664,8 +847,7 @@ export class AcpClient {
       await this.invokeSafely(this.onUpdate, params);
       const handlers = this.promptHandlers.get(params.sessionId);
       if (handlers) {
-        for (const handler of handlers)
-          await this.invokeSafely(handler, params);
+        for (const handler of handlers) await handler(params);
       }
       return;
     }
@@ -866,7 +1048,9 @@ export class AcpClient {
     this.rejectAll(resolved);
     this.pendingPermissions.forEach((permission) => permission.cancel());
     this.pendingPermissions.clear();
-    this.child?.kill("SIGTERM");
+    if (!(resolved instanceof AcpSpawnError && resolved.code === "ENOENT")) {
+      void this.terminateAfterFailure();
+    }
   }
 
   private rejectAll(error: Error): void {

@@ -74,7 +74,14 @@ export function missingApiKeyError(): LoadAPIKeyError {
 }
 
 export function isMissingExecutableError(error: unknown): boolean {
-  return error instanceof AcpSpawnError && error.code === "ENOENT";
+  return (
+    (error instanceof AcpSpawnError && error.code === "ENOENT") ||
+    (APICallError.isInstance(error) &&
+      error.data !== null &&
+      typeof error.data === "object" &&
+      "code" in error.data &&
+      error.data.code === "ENOENT")
+  );
 }
 
 export * from "./acp/errors.js";

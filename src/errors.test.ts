@@ -1,4 +1,5 @@
 import { APICallError, LoadAPIKeyError } from "@ai-sdk/provider";
+import { generateText } from "ai";
 import { describe, expect, it } from "vitest";
 import {
   AcpAuthenticationError,
@@ -6,7 +7,8 @@ import {
   AcpProcessExitError,
   AcpSpawnError,
 } from "./acp/errors.js";
-import { mapAcpError } from "./errors.js";
+import { isMissingExecutableError, mapAcpError } from "./errors.js";
+import { createGrokBuild } from "./grok-build-provider.js";
 
 describe("mapAcpError", () => {
   it("maps cached-login failures to the AI SDK authentication error surface", () => {
@@ -65,5 +67,19 @@ describe("mapAcpError", () => {
     const aborted = new Error("cancelled");
     aborted.name = "AbortError";
     expect(mapAcpError(aborted)).toBe(aborted);
+  });
+
+  it("recognizes a missing executable through the public generateText failure path", async () => {
+    const provider = createGrokBuild({
+      executablePath: "/definitely-missing/grok-build-review-test",
+    });
+    const error = await generateText({
+      model: provider(),
+      prompt: "ping",
+      maxRetries: 0,
+    }).catch((value: unknown) => value);
+
+    expect(error).toBeInstanceOf(APICallError);
+    expect(isMissingExecutableError(error)).toBe(true);
   });
 });

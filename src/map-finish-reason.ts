@@ -10,15 +10,17 @@ export function mapGrokBuildFinishReason(
     unified = "stop";
   } else if (
     normalized === "max_tokens" ||
-    normalized === "max_turn_requests" ||
-    normalized.includes("limit") ||
-    normalized.includes("max_turn") ||
-    normalized.includes("max_token")
+    normalized === "max_turn_requests"
   ) {
     unified = "length";
   } else if (normalized.includes("refusal")) {
     unified = "content-filter";
-  } else if (normalized.includes("error") || normalized.includes("failed")) {
+  } else if (
+    normalized === "rate_limit" ||
+    normalized.includes("error") ||
+    normalized.includes("failed") ||
+    normalized.includes("failure")
+  ) {
     unified = "error";
   } else {
     unified = "other";
