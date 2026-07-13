@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-07-12
 
 ### Added
 
@@ -22,4 +22,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Requires Node.js 18 or newer, AI SDK 6 for integration, `@ai-sdk/provider ^3`, and `@ai-sdk/provider-utils ^4`; supports Zod 3 or 4.
 - Dual ESM and CommonJS package output.
-- Validated against captured Grok Build 0.2.99 ACP traffic.
+- Validated against captured Grok Build 0.2.99 ACP traffic, including live fixtures for session restart/load replay, cancellation ordering (`stopReason: "cancelled"`), and the absence of `session/request_permission` enforcement over ACP in 0.2.99.
