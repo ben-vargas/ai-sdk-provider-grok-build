@@ -1,0 +1,111 @@
+{"type":"thought","data":"The"}
+{"type":"thought","data":" user"}
+{"type":"thought","data":" wants"}
+{"type":"thought","data":" me"}
+{"type":"thought","data":" to"}
+{"type":"thought","data":":\n"}
+{"type":"thought","data":"1"}
+{"type":"thought","data":"."}
+{"type":"thought","data":" Run"}
+{"type":"thought","data":" a"}
+{"type":"thought","data":" shell"}
+{"type":"thought","data":" command"}
+{"type":"thought","data":":"}
+{"type":"thought","data":" `"}
+{"type":"thought","data":"echo"}
+{"type":"thought","data":" hello"}
+{"type":"thought","data":"-"}
+{"type":"thought","data":"from"}
+{"type":"thought","data":"-"}
+{"type":"thought","data":"gro"}
+{"type":"thought","data":"k"}
+{"type":"thought","data":"`"}
+{"type":"thought","data":"Both"}
+{"type":"thought","data":" succeeded"}
+{"type":"thought","data":":\n"}
+{"type":"thought","data":"1"}
+{"type":"thought","data":"."}
+{"type":"thought","data":" Shell"}
+{"type":"thought","data":" command"}
+{"type":"thought","data":" output"}
+{"type":"thought","data":":"}
+{"type":"thought","data":" hello"}
+{"type":"thought","data":"-"}
+{"type":"thought","data":"from"}
+{"type":"thought","data":"-"}
+{"type":"thought","data":"gro"}
+{"type":"thought","data":"k"}
+{"type":"text","data":"Both"}
+{"type":"text","data":" confirmed"}
+{"type":"text","data":".\n\n"}
+{"type":"text","data":"1"}
+{"type":"text","data":"."}
+{"type":"text","data":" **"}
+{"type":"text","data":"Shell"}
+{"type":"text","data":" command"}
+{"type":"text","data":"**"}
+{"type":"text","data":" —"}
+{"type":"text","data":" `"}
+{"type":"text","data":"echo"}
+{"type":"text","data":" hello"}
+{"type":"text","data":"-"}
+{"type":"text","data":"from"}
+{"type":"text","data":"-"}
+{"type":"text","data":"gro"}
+{"type":"text","data":"k"}
+{"type":"text","data":"`"}
+{"type":"text","data":" printed"}
+{"type":"text","data":":\n"}
+{"type":"text","data":"  "}
+{"type":"text","data":" ```"}
+{"type":"text","data":"\n"}
+{"type":"text","data":"  "}
+{"type":"text","data":" hello"}
+{"type":"text","data":"-"}
+{"type":"text","data":"from"}
+{"type":"text","data":"-"}
+{"type":"text","data":"gro"}
+{"type":"text","data":"k"}
+{"type":"text","data":"\n"}
+{"type":"text","data":"  "}
+{"type":"text","data":" ```"}
+{"type":"text","data":"\n\n"}
+{"type":"text","data":"2"}
+{"type":"text","data":"."}
+{"type":"text","data":" **"}
+{"type":"text","data":"File"}
+{"type":"text","data":"**"}
+{"type":"text","data":" —"}
+{"type":"text","data":" `"}
+{"type":"text","data":"probe"}
+{"type":"text","data":".txt"}
+{"type":"text","data":"`"}
+{"type":"text","data":" was"}
+{"type":"text","data":" created"}
+{"type":"text","data":" with"}
+{"type":"text","data":" exactly"}
+{"type":"text","data":":\n"}
+{"type":"text","data":"  "}
+{"type":"text","data":" ```"}
+{"type":"text","data":"\n"}
+{"type":"text","data":"  "}
+{"type":"text","data":" gro"}
+{"type":"text","data":"k"}
+{"type":"text","data":"-"}
+{"type":"text","data":"was"}
+{"type":"text","data":"-"}
+{"type":"text","data":"here"}
+{"type":"text","data":"\n"}
+{"type":"text","data":"  "}
+{"type":"text","data":" ```"}
+{"type":"text","data":"\n"}
+{"type":"text","data":"  "}
+{"type":"text","data":" ("}
+{"type":"text","data":"13"}
+{"type":"text","data":" bytes"}
+{"type":"text","data":","}
+{"type":"text","data":" no"}
+{"type":"text","data":" trailing"}
+{"type":"text","data":" newline"}
+{"type":"text","data":")"}
+{"type":"end","stopReason":"EndTurn","sessionId":"019f58fb-f734-7a41-9a19-24b6b97beb8a","requestId":"08e21380-2168-4cd4-9b80-5d2c7e57d4c3","usage":{"input_tokens":9838,"cache_read_input_tokens":21504,"output_tokens":267,"reasoning_tokens":187,"total_tokens":31609},"num_turns":2,"modelUsage":{"grok-4.5":{"inputTokens":9838,"outputTokens":267,"cacheReadInputTokens":21504,"modelCalls":2}}}
