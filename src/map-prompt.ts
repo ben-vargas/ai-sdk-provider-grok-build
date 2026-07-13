@@ -22,6 +22,19 @@ function compatibility(feature: string, details: string): SharedV3Warning {
   return { type: "compatibility", feature, details };
 }
 
+function hasCallerHeaders(
+  headers: LanguageModelV3CallOptions["headers"],
+): boolean {
+  return Object.entries(headers ?? {}).some(
+    ([name, value]) =>
+      value !== undefined &&
+      !(
+        name.toLowerCase() === "user-agent" &&
+        /^ai\/\d+(?:\.\d+)*(?:[-+][\w.-]+)?$/.test(value)
+      ),
+  );
+}
+
 function safeStringify(value: unknown): string {
   try {
     return JSON.stringify(value);
@@ -268,9 +281,7 @@ export function mapGrokBuildCallWarnings(
     ["topK", options.topK],
     ["presencePenalty", options.presencePenalty],
     ["frequencyPenalty", options.frequencyPenalty],
-    ["stopSequences", options.stopSequences],
     ["seed", options.seed],
-    ["headers", options.headers],
   ];
   for (const [feature, value] of unsupportedSettings) {
     if (value !== undefined) {
@@ -281,6 +292,22 @@ export function mapGrokBuildCallWarnings(
         ),
       );
     }
+  }
+  if (options.stopSequences && options.stopSequences.length > 0) {
+    warnings.push(
+      unsupported(
+        "stopSequences",
+        "Grok ACP exposes no stopSequences input; the setting was ignored.",
+      ),
+    );
+  }
+  if (hasCallerHeaders(options.headers)) {
+    warnings.push(
+      unsupported(
+        "headers",
+        "Grok ACP exposes no headers input; the setting was ignored.",
+      ),
+    );
   }
   if (options.tools && options.tools.length > 0) {
     warnings.push(

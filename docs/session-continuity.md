@@ -58,9 +58,8 @@ Keep `cwd` and MCP configuration stable across calls. Cross-directory session lo
 
 ## Current verification boundary
 
-Real captures prove `session/new`, returned session IDs, and the presence of the advertised `loadSession` capability. Unit coverage verifies that an explicit ID selects `session/load` instead of `session/new`. Live fixture coverage does not yet establish:
+Real fixture captures prove `session/new`, returned session IDs, and restart replay through `session/load`. After the original ACP process exits, a new process loads the explicit session ID, receives the prior user and assistant chunks before the load response, and successfully recalls that context in a follow-up prompt. Coverage also verifies that an explicit ID selects `session/load` instead of `session/new`. It does not yet establish:
 
-- replay ordering after the original ACP process exits;
 - behavior for missing, expired, or malformed IDs;
 - cross-`cwd` loading;
 - concurrent prompts against one session;

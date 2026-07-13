@@ -4,9 +4,6 @@ import { grokBuild } from "../dist/index.js";
 const result = streamText({
   model: grokBuild(),
   prompt: "What is 17 + 25? Think briefly, then give the number.",
-  providerOptions: {
-    "grok-build": { reasoningEffort: "low" },
-  },
 });
 
 let reasoningStarted = false;
@@ -25,7 +22,15 @@ for await (const part of result.stream) {
       process.stdout.write(reasoningStarted ? "\nAnswer: " : "Answer: ");
     }
     process.stdout.write(part.text);
+  } else if (part.type === "error") {
+    throw part.error;
   }
 }
 
 process.stdout.write("\n");
+if (!reasoningStarted) {
+  throw new Error("The stream returned no reasoning deltas.");
+}
+if (!answerStarted) {
+  throw new Error("The stream returned no answer deltas.");
+}

@@ -67,7 +67,7 @@ const { text } = await generateText({
 console.log(text);
 ```
 
-`grokBuild()` uses the model currently resolved by Grok. A model ID can be supplied, but Grok Build 0.2.99 does not expose a fixture-verified ACP model setter; if the runtime resolves a different model, the provider keeps it and emits a compatibility warning.
+`grokBuild()` uses the model currently resolved by Grok. A model ID can be supplied, but Grok Build 0.2.99 does not expose a fixture-verified ACP model setter. A requested ID absent from Grok's advertised catalog produces an unsupported warning; an advertised ID that differs from the resolved model produces a compatibility warning. In both cases, the provider keeps the runtime-selected model.
 
 ### Streaming
 
@@ -190,7 +190,7 @@ const result = await generateText({
 
 | Option                   | Type                               | Behavior                                                                                                                |
 | ------------------------ | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `model`                  | `string`                           | Requests a model for this call. If it differs from Grok's resolved model, the runtime value is retained with a warning. |
+| `model`                  | `string`                           | Requests a model. Unavailable IDs warn as unsupported; unresolved advertised IDs warn as compatible.                   |
 | `reasoningEffort`        | `'low' \| 'medium' \| 'high'`      | Requests an advertised effort. A differing current effort cannot yet be changed and produces a warning.                 |
 | `session.id`             | `string`                           | Loads this ACP session instead of creating one. Mutually exclusive with `session.resume`.                               |
 | `session.resume`         | `string`                           | Alias input for loading an explicit session ID. Mutually exclusive with `session.id`.                                   |

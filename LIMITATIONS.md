@@ -71,7 +71,7 @@ Each supplied option is ignored with an `unsupported` warning. A Grok `max_token
 
 Session metadata advertises the current model and available reasoning efforts, but captured ACP traffic does not establish a setter for either value.
 
-- A requested model that differs from Grok's resolved model is not applied and produces a compatibility warning.
+- A requested model absent from Grok's advertised catalog is not applied and produces an `unsupported` warning. An advertised model that differs from Grok's resolved model is not applied and produces a compatibility warning.
 - `low`, `medium`, and `high` reasoning effort values are accepted only as requests. A value equal to the current effort needs no change; a different advertised value produces a compatibility warning and the runtime effort is retained.
 - Unsupported effort values produce an `unsupported` warning.
 

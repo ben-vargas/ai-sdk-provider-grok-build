@@ -11,16 +11,21 @@ The default authentication method is `cached_token`, which reuses the login stor
 Grok CLI. Run `grok login` first if needed. `XAI_API_KEY` is supported separately by creating
 a provider with `authMethod: "api_key"`.
 
-| Example                  | Demonstrates                                             |
-| ------------------------ | -------------------------------------------------------- |
-| `basic-generate-text.ts` | `generateText` and the returned ACP session ID           |
-| `streaming.ts`           | visible reasoning and answer deltas                      |
-| `tool-activity.ts`       | provider-executed tool calls and results                 |
-| `session-continuity.ts`  | resuming an ACP session ID for a second call             |
-| `abort-signal.ts`        | cancelling a stream with `AbortSignal`                   |
-| `error-handling.ts`      | handling a bad requested model ID                        |
-| `usage-and-cost.ts`      | AI SDK usage, per-model ACP usage, and cost availability |
-| `provider-options.ts`    | call-level `reasoningEffort` and `permissionMode`        |
+| Example                  | Demonstrates                                                  |
+| ------------------------ | ------------------------------------------------------------- |
+| `basic-generate-text.ts` | `generateText` and the returned ACP session ID                |
+| `streaming.ts`           | visible reasoning and answer deltas                           |
+| `tool-activity.ts`       | provider-executed tool calls and results                      |
+| `session-continuity.ts`  | resuming an ACP session ID for a second call                  |
+| `abort-signal.ts`        | cancelling a stream with `AbortSignal`                        |
+| `error-handling.ts`      | handling a bad requested model ID                             |
+| `usage-and-cost.ts`      | AI SDK usage, per-model ACP usage, and cost availability      |
+| `provider-options.ts`    | call-level option syntax and reasoning compatibility warnings |
 
 Prompts are intentionally small. `tool-activity.ts` permits provider-executed tools without an
 interactive approval prompt and asks Grok to perform one read-only terminal operation.
+`provider-options.ts` deliberately requests a reasoning effort that may differ from the
+runtime value so it can label and display the resulting compatibility warning.
+`error-handling.ts` likewise demonstrates a model-selection warning when the runtime falls
+back instead of rejecting the invalid ID. `session-continuity.ts` labels the compatibility
+warning that accompanies every explicit session load.
