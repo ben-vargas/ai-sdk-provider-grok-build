@@ -439,7 +439,7 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
           type: "compatibility",
           feature: "session load",
           details:
-            "Grok advertises session/load, but replay ordering and cross-CWD behavior are not fixture-verified.",
+            "session/load restart replay is fixture-verified, but invalid-ID, cross-CWD, and concurrent-prompt behavior are not.",
         });
       } else {
         const result = await client.newSession({ cwd, mcpServers }, signal);

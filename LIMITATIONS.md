@@ -83,7 +83,7 @@ Session metadata advertises the current model and available reasoning efforts, b
 
 ## Sessions
 
-New session creation and returned IDs are fixture-verified. Grok advertises `session/load`, and the provider calls it for an explicit `session.id` or `session.resume`, but live captures do not yet prove restart replay, invalid-ID handling, cross-directory behavior, or concurrent prompts. Every load emits a compatibility warning.
+New session creation and returned IDs are fixture-verified. Restart replay is now also fixture-verified (`fixtures/acp/restart-load.jsonl`, captured with `scripts/acp-scenarios.mjs`): after the original process was killed, a new process initialized and called `session/load` with the session ID, `cwd`, and MCP servers; Grok replayed the prior conversation as `user_message_chunk` and `agent_message_chunk` `session/update` notifications before the load response returned; the load result included the models object; and a follow-up prompt correctly recalled earlier context. The provider calls `session/load` for an explicit `session.id` or `session.resume`. Invalid session IDs, cross-directory loads, and concurrent prompts remain unverified, and every load still emits a compatibility warning.
 
 `session.continue` cannot find the most recent session and is ignored with a warning. `session.fork` is not advertised by ACP and creates a new session with a warning instead of cloning the source.
 
@@ -91,11 +91,17 @@ Each AI SDK call starts and disposes its own ACP process. Continuity comes from 
 
 ## Cancellation
 
-On abort, the provider sends the standard `session/cancel` notification, cancels local pending work, answers pending permission requests as cancelled, and disposes the child process. Captures do not yet verify final event ordering or whether every in-flight Grok tool stops before process cleanup.
+On abort, the provider sends the standard `session/cancel` notification, cancels local pending work, answers pending permission requests as cancelled, and disposes the child process.
+
+Final event ordering is now fixture-verified (`fixtures/acp/cancel.jsonl`, captured with `scripts/acp-scenarios.mjs`). After the client sends `session/cancel` mid-stream, Grok continues emitting `session/update` chunks while it drains the in-flight model turn (33 further chunks in the capture), then emits the `_x.ai/session/prompt_complete` extension notification with stop reason `cancelled`, may emit additional update chunks after it (one was observed), and finally resolves the `session/prompt` response with `stopReason: "cancelled"`. The provider already matches this ordering: it keeps consuming updates until the prompt response resolves and never treats `prompt_complete` as the last event. Consumers of the low-level `AcpClient` must do the same.
+
+The capture was a pure text turn, so whether an in-flight Grok tool execution is terminated by cancellation remains unverified.
 
 **Impact:** cancellation is best-effort at the Grok runtime boundary. Applications should not assume that an external side effect is rolled back.
 
 ## Permissions
+
+**Grok Build 0.2.99 does not enforce permission modes over ACP.** Dedicated live captures (`fixtures/acp/permission-allow.jsonl` and `fixtures/acp/permission-plan.jsonl`, captured with `scripts/acp-scenarios.mjs`) probed `--permission-mode default` and `--permission-mode plan`, with session metadata confirming `yolo: false`. In every case Grok auto-executed terminal commands — including `curl` network access and `rm` — and file writes through its `write` tool, and never emitted `session/request_permission`. The effective ACP behavior in 0.2.99 is always-approve regardless of configuration.
 
 ACP permission requests require an immediate JSON-RPC response, which does not match AI SDK deferred `tool-approval-request` parts. The provider therefore does not emit deferred AI SDK approvals.
 
@@ -104,9 +110,9 @@ Public provider settings currently expose two modes:
 - `default`: if Grok sends an unhandled live permission request, reject it clearly rather than hang;
 - `bypassPermissions`: automatically select Grok's `allow_once` option, falling back to `allow_always` when that is the only allow choice.
 
-The permission request path exists in the client and is unit-tested, but it was not observed in the captured Grok traces. Mode mutation and all option combinations remain compatibility-sensitive.
+The permission request path stays implemented in the client, unit-tested, and capability-gated for future Grok versions, but Grok 0.2.99 never exercises it: no capture contains a `session/request_permission`, so in practice neither mode changes what Grok executes. Mode mutation and all option combinations remain compatibility-sensitive.
 
-**Security:** use `bypassPermissions` only when the Grok process is allowed to perform every requested action in the configured working directory and environment.
+**Security:** treat every ACP session as if `bypassPermissions` were active, because in Grok Build 0.2.99 it effectively is. Isolate side effects with the working directory, the process environment, and Grok's `--sandbox` profiles — not with permission modes.
 
 ## Usage accounting
 

@@ -137,7 +137,7 @@ Pass settings to `createGrokBuild(settings)`, or as the second argument to a pro
 | `cwd`                | `string`                           | `process.cwd()`             | Process working directory and ACP session working directory.                                                                                                                                                                         |
 | `env`                | `NodeJS.ProcessEnv`                | Current process environment | Environment additions/overrides passed to Grok.                                                                                                                                                                                      |
 | `authMethod`         | `string`                           | `'cached_token'`            | Authentication route. Existing cached CLI state is tried first; after an authentication failure, ACP authenticates the advertised method and retries the session once. The special `'api_key'` value supplies `XAI_API_KEY` to Grok. |
-| `permissionMode`     | `'default' \| 'bypassPermissions'` | `'default'`                 | In bypass mode, select `allow_once` (or `allow_always`) when Grok sends a permission request. Default mode rejects an unhandled live request rather than hanging.                                                                    |
+| `permissionMode`     | `'default' \| 'bypassPermissions'` | `'default'`                 | In bypass mode, select `allow_once` (or `allow_always`) when Grok sends a permission request. Default mode rejects an unhandled live request rather than hanging. Grok Build 0.2.99 never sends permission requests over ACP and auto-executes all tools; see the security note under Tool visibility and ownership.  |
 | `defaultModel`       | `string`                           | `'default'`                 | Model ID requested when no ID is passed to the provider. Selection is advisory until Grok exposes a verified ACP setter.                                                                                                             |
 | `mcpServers`         | `AcpMcpServer[]`                   | `[]`                        | MCP servers sent with every `session/new` or `session/load`. Per-call servers override same-named defaults.                                                                                                                          |
 | `timeouts.requestMs` | positive integer                   | `30000`                     | Timeout for ordinary ACP JSON-RPC requests.                                                                                                                                                                                          |
@@ -228,11 +228,13 @@ const second = await generateText({
 });
 ```
 
-Grok advertises `session/load`, but captured fixtures do not yet prove restart replay ordering, invalid-ID behavior, cross-directory loading, or concurrent prompts. The provider emits a compatibility warning whenever it loads a session. See [Session continuity](docs/session-continuity.md) for the complete guide and constraints.
+Restart replay is fixture-verified: after a process restart, `session/load` replays the prior conversation as `session/update` notifications before the load response returns, and a follow-up prompt recalls earlier context. Invalid-ID behavior, cross-directory loading, and concurrent prompts are not yet proven, and the provider still emits a compatibility warning whenever it loads a session. See [Session continuity](docs/session-continuity.md) for the complete guide and constraints.
 
 ## Tool visibility and ownership
 
 Grok's shell, filesystem, search, fetch, and MCP tools execute inside the Grok Build runtime. The provider surfaces their lifecycle as dynamic AI SDK `tool-call` and `tool-result` parts. Calls are marked `providerExecuted: true`, so your application should observe them—not execute them again.
+
+> **Security:** Grok Build 0.2.99 does not enforce permission modes over ACP. Live captures with `--permission-mode default` and `--permission-mode plan` (session metadata `yolo: false`) show Grok auto-executing terminal commands—including network access and file deletion—and file writes without ever sending `session/request_permission`. Treat every ACP session as if `bypassPermissions` were active: isolate side effects with `cwd`, the process environment, and Grok's `--sandbox` profiles, not with permission modes.
 
 ```typescript
 const result = streamText({
@@ -270,7 +272,8 @@ The largest differences from a direct HTTP model provider are:
 - no native structured-output guarantee;
 - no image, audio, or arbitrary binary input;
 - no sampling controls, stop sequences, seed, maximum output token control, or enforceable maximum turns;
-- model/reasoning mutation, session loading, cancellation ordering, and interactive permissions are not fully fixture-verified;
+- permission modes are not enforced by Grok Build 0.2.99 over ACP: Grok auto-executes all tools without permission requests, so every session effectively runs as `bypassPermissions`;
+- model/reasoning mutation is not fixture-verified; session restart replay and cancellation ordering now are, while invalid session IDs, cross-directory loads, concurrent prompts, and in-flight tool termination on cancel remain unverified;
 - fresh-session role history is serialized into prompt text rather than imported as native roles;
 - no source, generated-file, reasoning-file, custom-content, embedding, or image-generation surface;
 - ACP and xAI extension records can change with Grok CLI releases.
