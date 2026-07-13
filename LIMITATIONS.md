@@ -14,7 +14,7 @@ Grok can still execute its own shell, filesystem, search, fetch, and MCP tools. 
 
 ### Tool streaming depends on ACP and xAI extensions
 
-Standard ACP tool-call and tool-result updates are mapped. Preliminary results may be emitted before the final result. The standard `tool_call` input snapshot becomes the AI SDK tool input. Version-specific xAI argument-delta notifications are available only as optional raw extension events; the provider does not merge them into the standard tool call.
+Standard ACP tool-call and tool-result updates are mapped. Streams may emit replaceable preliminary results before the final result; non-streaming generation retains only the latest result for each tool call and replaces it with the final result. The redacted standard `tool_call` input snapshot becomes the AI SDK tool input. Version-specific xAI argument-delta notifications are available only as optional raw extension events; the provider does not merge them into the standard tool call.
 
 Raw byte arrays, terminal handles, and diffs are normalized into JSON/text where possible and retained in provider metadata. They are not guaranteed to correspond one-for-one with user-visible terminal output.
 
@@ -110,7 +110,7 @@ The permission request path exists in the client and is unit-tested, but it was 
 
 ## Usage accounting
 
-The provider maps total input tokens, cache-read tokens, total output tokens, and reasoning tokens when Grok returns them. It derives no-cache input as `input - cacheRead`.
+The provider maps total input tokens, cache-read tokens, total output tokens, and reasoning tokens when Grok returns them. It leaves no-cache input undefined because captured traces do not prove whether Grok's input total includes cached reads. Missing input or output totals remain undefined rather than being fabricated as zero.
 
 Grok does not currently provide mapped values for cache writes or independent text-output tokens, so those fields remain `undefined`. Per-model call details are retained in provider metadata when present.
 
@@ -124,7 +124,7 @@ The provider does not synthesize AI SDK content from unrelated protocol records.
 - V4 custom content;
 - tool approval output parts.
 
-xAI extension notifications remain `raw` events when requested. A URL printed by a tool is not promoted to a verified source, and a file path or diff is not promoted to a generated file.
+xAI extension notifications remain redacted `raw` events when requested. Credential-like fields, authorization headers, environment values, and inline token assignments are removed from raw and tool metadata. A URL printed by a tool is not promoted to a verified source, and a file path or diff is not promoted to a generated file.
 
 The provider also does not implement embeddings, image generation, transcription, speech, reranking, provider files, or provider skills. `embeddingModel()` and `imageModel()` throw `NoSuchModelError`; unsupported optional factories are absent.
 
@@ -142,4 +142,4 @@ The provider is Node-only because it spawns a local executable. It requires Node
 
 The provider targets ACP protocol version 1 and is validated against real Grok Build 0.2.99 captures. Standard ACP records and `_x.ai/*` extensions can evolve in later CLI versions.
 
-Optional extension records can be exposed as raw events. Unknown standard `session/update` variants are not converted into typed AI SDK parts, although `includeRawChunks` preserves the original update. Unknown agent-to-client requests receive a JSON-RPC error instead of being accepted. Revalidate behavior after upgrading Grok Build when your application depends on raw events or exact tool payloads.
+Optional extension records can be exposed as redacted raw events. Unknown optional standard `session/update` variants are preserved as redacted raw records and produce one compatibility warning per kind. Malformed required text/tool updates and unknown events that can affect completion, tool identity, permissions, or usage fail with an ACP protocol error. Unknown agent-to-client requests receive a JSON-RPC error instead of being accepted. Revalidate behavior after upgrading Grok Build when your application depends on raw events or exact tool payloads.

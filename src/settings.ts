@@ -116,6 +116,12 @@ export const grokBuildSettingsSchema: z.ZodType<GrokBuildSettings> = z
   })
   .strict();
 
+const grokBuildModelIdSchema = z.string().trim().min(1);
+
+export function validateGrokBuildModelId(modelId: string): string {
+  return grokBuildModelIdSchema.parse(modelId);
+}
+
 const sessionOptionsSchema = z
   .object({
     id: z.string().min(1).optional(),
