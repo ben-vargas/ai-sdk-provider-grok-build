@@ -16,10 +16,12 @@ The default authentication path reuses your Grok CLI login, including its renewa
 
 ## Version compatibility
 
-| Git branch  | AI SDK | Provider interfaces              | npm tag     | Status             |
-| ----------- | ------ | -------------------------------- | ----------- | ------------------ |
-| `main`      | v7     | `LanguageModelV4` / `ProviderV4` | `latest`    | Active line        |
-| `ai-sdk-v6` | v6     | `LanguageModelV3` / `ProviderV3` | `ai-sdk-v6` | Compatibility line |
+| Git branch  | AI SDK | Provider interfaces              | Package versions | npm tag     | Status             |
+| ----------- | ------ | -------------------------------- | ---------------- | ----------- | ------------------ |
+| `main`      | v7     | `LanguageModelV4` / `ProviderV4` | `1.x`            | `latest`    | Active line        |
+| `ai-sdk-v6` | v6     | `LanguageModelV3` / `ProviderV3` | `0.2.x`          | `ai-sdk-v6` | Compatibility line |
+
+Package version lines track AI SDK generations: install with `ai-sdk-provider-grok-build@^1` for AI SDK v7 or `ai-sdk-provider-grok-build@ai-sdk-v6` (`^0.2`) for AI SDK v6. The early `0.1.x` and `0.1.x-ai-sdk-v6` versions predate this policy and are deprecated.
 
 The ACP client, process lifecycle, protocol types, session handling, and normalized event mapping are independent of the AI SDK adapter generation. This branch changes the adapter and package surface, not the transport.
 
