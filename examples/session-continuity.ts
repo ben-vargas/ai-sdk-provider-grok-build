@@ -11,8 +11,16 @@ if (typeof sessionId !== "string") {
   throw new Error("The first call returned no grok-build sessionId.");
 }
 
-console.log("Turn 1:", first.text.trim());
+const firstResponse = first.text.trim();
+if (firstResponse !== "OK") {
+  throw new Error(
+    `Expected the first response to be "OK", received ${JSON.stringify(firstResponse)}.`,
+  );
+}
+
+console.log("Turn 1:", firstResponse);
 console.log("Session:", sessionId);
+console.log("Resume: an expected session-load compatibility warning follows.");
 
 const second = await generateText({
   model: grokBuild(),
@@ -22,7 +30,14 @@ const second = await generateText({
   },
 });
 
-console.log("Turn 2:", second.text.trim());
+const resumedResponse = second.text.trim().toLowerCase();
+if (resumedResponse !== "papaya") {
+  throw new Error(
+    `Expected the resumed session to return "papaya", received ${JSON.stringify(second.text.trim())}.`,
+  );
+}
+
+console.log("Turn 2:", resumedResponse);
 if (second.warnings && second.warnings.length > 0) {
-  console.log("Warnings:", second.warnings);
+  console.log("Expected session-load compatibility warnings:", second.warnings);
 }
