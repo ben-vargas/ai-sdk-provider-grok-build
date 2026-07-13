@@ -1,0 +1,13 @@
+node_modules/
+dist/
+coverage/
+.nyc_output/
+
+# Captured and generated artifacts
+fixtures/
+scripts/acp-probe.mjs
+*.d.ts
+
+# Research documents are preserved verbatim
+FEASIBILITY.md
+GAP_ANALYSIS.md
