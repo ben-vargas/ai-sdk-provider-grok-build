@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1-ai-sdk-v6] - 2026-07-13
+
+### Fixed
+
+- Removed a spurious `headers` unsupported-setting warning emitted on every call: the AI SDK core injects a `user-agent` header into each request, which the provider mistook for caller-set headers. The warning now fires only for real caller-supplied header entries.
+- `stopSequences: []` no longer warns; the warning fires only for non-empty stop sequences.
+
+### Changed
+
+- Examples hardened to self-verify their stated intent with clearer output; deliberate warning demonstration now lives only in `provider-options.ts`.
+
 ## [0.1.0-ai-sdk-v6] - 2026-07-12
 
 ### Added
