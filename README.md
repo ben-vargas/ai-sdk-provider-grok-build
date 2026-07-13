@@ -3,12 +3,12 @@
 [![npm version](https://img.shields.io/npm/v/ai-sdk-provider-grok-build.svg)](https://www.npmjs.com/package/ai-sdk-provider-grok-build)
 [![npm downloads](https://img.shields.io/npm/dm/ai-sdk-provider-grok-build.svg)](https://www.npmjs.com/package/ai-sdk-provider-grok-build)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Node >= 22](https://img.shields.io/badge/node-%3E%3D22-43853d?logo=node.js&logoColor=white)
-![AI SDK v7](https://img.shields.io/badge/AI%20SDK-v7-000?logo=vercel&logoColor=white)
-![Modules: ESM only](https://img.shields.io/badge/modules-ESM%20only-3178c6)
+![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-43853d?logo=node.js&logoColor=white)
+![AI SDK v6](https://img.shields.io/badge/AI%20SDK-v6-000?logo=vercel&logoColor=white)
+![Modules: ESM + CJS](https://img.shields.io/badge/modules-ESM%20%2B%20CJS-3178c6)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/ben-vargas/ai-sdk-provider-grok-build/issues)
 
-Use xAI's Grok Build CLI through the [Vercel AI SDK](https://ai-sdk.dev/). The provider starts `grok --no-auto-update agent stdio` and translates Agent Client Protocol (ACP) JSON-RPC messages into AI SDK v7 `LanguageModelV4` events.
+Use xAI's Grok Build CLI through the [Vercel AI SDK](https://ai-sdk.dev/). The provider starts `grok --no-auto-update agent stdio` and translates Agent Client Protocol (ACP) JSON-RPC messages into AI SDK v6 `LanguageModelV3` events.
 
 The default authentication path reuses your Grok CLI login, including its renewable cached OAuth/session credentials. Log in once with `grok`, then it just works—no separate API key is required. `XAI_API_KEY` remains available as an alternative for CI and other non-interactive environments.
 
@@ -16,12 +16,12 @@ The default authentication path reuses your Grok CLI login, including its renewa
 
 ## Version compatibility
 
-| Git branch  | AI SDK | Provider interfaces              | npm tag     | Status       |
-| ----------- | ------ | -------------------------------- | ----------- | ------------ |
-| `main`      | v7     | `LanguageModelV4` / `ProviderV4` | `latest`    | Active line  |
-| `ai-sdk-v6` | v6     | `LanguageModelV3` / `ProviderV3` | `ai-sdk-v6` | Planned port |
+| Git branch  | AI SDK | Provider interfaces              | npm tag     | Status             |
+| ----------- | ------ | -------------------------------- | ----------- | ------------------ |
+| `main`      | v7     | `LanguageModelV4` / `ProviderV4` | `latest`    | Active line        |
+| `ai-sdk-v6` | v6     | `LanguageModelV3` / `ProviderV3` | `ai-sdk-v6` | Compatibility line |
 
-The ACP client, process lifecycle, protocol types, session handling, and normalized event mapping are kept independent of the AI SDK adapter generation. The future `ai-sdk-v6` branch will change the adapter layer, not the transport.
+The ACP client, process lifecycle, protocol types, session handling, and normalized event mapping are independent of the AI SDK adapter generation. This branch changes the adapter and package surface, not the transport.
 
 ## Installation
 
@@ -46,10 +46,10 @@ For an SSH host without a browser, use `grok login --device-auth`.
 ### 2. Install the provider
 
 ```bash
-npm install ai@^7.0.16 ai-sdk-provider-grok-build zod@^4
+npm install ai@^6 ai-sdk-provider-grok-build@ai-sdk-v6 zod@^4
 ```
 
-Requirements: Node.js 22 or newer, AI SDK `^7.0.16`, and Zod 4. The package is ESM-only; use `import` or dynamic `import()`.
+Requirements: Node.js 18 or newer and AI SDK 6. Zod 3 and 4 are supported peer ranges. The package provides both ESM and CommonJS entry points.
 
 ## Quick start: cached Grok login
 
@@ -125,23 +125,25 @@ configured();
 
 The provider exposes language models only. `embeddingModel()` and `imageModel()` throw `NoSuchModelError`; transcription, speech, reranking, files, and skills factories are not exposed.
 
+The root entry also exports `AcpClient`, `AcpClientOptions`, `AcpClientFactory`, and the related client handler/spawn types as a supported low-level integration surface. `AcpClient.dispose()` is asynchronous and completes after bounded cancellation and process termination.
+
 ## Provider settings
 
 Pass settings to `createGrokBuild(settings)`, or as the second argument to a provider model call. Per-model settings merge over provider defaults; `env` and `timeouts` are shallow-merged.
 
-| Setting              | Type                               | Default                     | Behavior                                                                                                                                                                           |
-| -------------------- | ---------------------------------- | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `executablePath`     | `string`                           | `grok` from `PATH`          | Grok Build executable to spawn.                                                                                                                                                    |
-| `cwd`                | `string`                           | `process.cwd()`             | Process working directory and ACP session working directory.                                                                                                                       |
-| `env`                | `NodeJS.ProcessEnv`                | Current process environment | Environment additions/overrides passed to Grok.                                                                                                                                    |
-| `authMethod`         | `string`                           | `'cached_token'`            | Authentication route. ACP authenticates `cached_token` and other advertised method IDs. The special `'api_key'` value skips ACP `authenticate` and supplies `XAI_API_KEY` to Grok. |
-| `permissionMode`     | `'default' \| 'bypassPermissions'` | `'default'`                 | In bypass mode, select `allow_once` (or `allow_always`) when Grok sends a permission request. Default mode rejects an unhandled live request rather than hanging.                  |
-| `defaultModel`       | `string`                           | `'default'`                 | Model ID requested when no ID is passed to the provider. Selection is advisory until Grok exposes a verified ACP setter.                                                           |
-| `mcpServers`         | `AcpMcpServer[]`                   | `[]`                        | MCP servers sent with every `session/new` or `session/load`. Per-call servers override same-named defaults.                                                                        |
-| `timeouts.requestMs` | positive integer                   | `30000`                     | Timeout for ordinary ACP JSON-RPC requests.                                                                                                                                        |
-| `timeouts.promptMs`  | positive integer                   | none                        | Timeout for `session/prompt`.                                                                                                                                                      |
-| `logger`             | logger object                      | no-op logger                | Object implementing `debug`, `info`, `warn`, and `error`. Current provider diagnostics use `debug`.                                                                                |
-| `includeRawChunks`   | `boolean`                          | `false`                     | Emit standard ACP updates and xAI extension notifications as AI SDK `raw` stream parts.                                                                                            |
+| Setting              | Type                               | Default                     | Behavior                                                                                                                                                                                                                             |
+| -------------------- | ---------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `executablePath`     | `string`                           | `grok` from `PATH`          | Grok Build executable to spawn.                                                                                                                                                                                                      |
+| `cwd`                | `string`                           | `process.cwd()`             | Process working directory and ACP session working directory.                                                                                                                                                                         |
+| `env`                | `NodeJS.ProcessEnv`                | Current process environment | Environment additions/overrides passed to Grok.                                                                                                                                                                                      |
+| `authMethod`         | `string`                           | `'cached_token'`            | Authentication route. Existing cached CLI state is tried first; after an authentication failure, ACP authenticates the advertised method and retries the session once. The special `'api_key'` value supplies `XAI_API_KEY` to Grok. |
+| `permissionMode`     | `'default' \| 'bypassPermissions'` | `'default'`                 | In bypass mode, select `allow_once` (or `allow_always`) when Grok sends a permission request. Default mode rejects an unhandled live request rather than hanging.                                                                    |
+| `defaultModel`       | `string`                           | `'default'`                 | Model ID requested when no ID is passed to the provider. Selection is advisory until Grok exposes a verified ACP setter.                                                                                                             |
+| `mcpServers`         | `AcpMcpServer[]`                   | `[]`                        | MCP servers sent with every `session/new` or `session/load`. Per-call servers override same-named defaults.                                                                                                                          |
+| `timeouts.requestMs` | positive integer                   | `30000`                     | Timeout for ordinary ACP JSON-RPC requests.                                                                                                                                                                                          |
+| `timeouts.promptMs`  | positive integer                   | none                        | Timeout for `session/prompt`.                                                                                                                                                                                                        |
+| `logger`             | logger object                      | no-op logger                | Object implementing `debug`, `info`, `warn`, and `error`. Current provider diagnostics use `debug`.                                                                                                                                  |
+| `includeRawChunks`   | `boolean`                          | `false`                     | Emit redacted standard ACP updates and xAI extension notifications as AI SDK `raw` stream parts. Unknown optional updates are preserved as redacted raw data even when this is false.                                                |
 
 Settings are strict and validated with Zod; unknown keys and invalid values throw before a call starts.
 
@@ -203,7 +205,7 @@ Unknown keys are rejected. Message- and part-level provider options are ignored 
 
 ## Session continuity
 
-The terminal `finish` event includes the ACP session ID at `providerMetadata['grok-build'].sessionId`. With AI SDK v7, read it from the final step and pass it to the next call:
+The terminal `finish` event includes the ACP session ID at `providerMetadata['grok-build'].sessionId`. With AI SDK v6, read it from the generated result and pass it to the next call:
 
 ```typescript
 const first = await generateText({
@@ -211,7 +213,7 @@ const first = await generateText({
   prompt: "Create a migration checklist.",
 });
 
-const sessionId = first.finalStep.providerMetadata?.["grok-build"]?.sessionId;
+const sessionId = first.providerMetadata?.["grok-build"]?.sessionId;
 
 if (typeof sessionId !== "string") {
   throw new Error("Grok Build did not return a session ID");
@@ -249,14 +251,14 @@ for await (const part of result.fullStream) {
 
 AI SDK function tools are a different ownership model: the application normally receives a tool call and executes it. ACP 1 has no client-defined tool registration/result-submission channel, so `tools` and non-default `toolChoice` values are ignored with typed warnings. Configure Grok-native tools or MCP servers instead.
 
-Tool input snapshots and result updates are normalized from standard ACP notifications. Preliminary tool results may be emitted before the final result. Raw input, output, status, title, and xAI tool metadata remain available in provider metadata. xAI extension argument deltas are not merged into the standard tool call; request extension events when that version-specific detail is needed.
+Tool input snapshots and result updates are normalized from standard ACP notifications. Streams may contain replaceable preliminary tool results before the final result; `doGenerate` retains only the latest correlated result and always replaces it with the final result. Redacted input, output, status, title, and xAI tool metadata remain available in provider metadata. xAI extension argument deltas are not merged into the standard tool call; request extension events when that version-specific detail is needed.
 
 ## Output, usage, and metadata
 
 - Assistant and reasoning chunks are emitted as separate AI SDK text and reasoning blocks.
-- `doGenerate()` aggregates the same ordered stream used by `doStream()`.
+- `doGenerate()` aggregates canonical content from the same ordered stream used by `doStream()`, replacing correlated preliminary tool results with the final result.
 - Usage maps input, cache-read, output, and reasoning tokens when Grok supplies them. Cache-write and independent text-output counts remain unknown.
-- Finish metadata uses the `'grok-build'` key and includes `sessionId`, optional `requestId`, raw Grok `stopReason`, and optional per-model usage.
+- Finish metadata uses the `'grok-build'` key and includes session/request/prompt IDs, the raw Grok stop reason, resolved model, advertised model catalog, current and supported reasoning efforts, agent version, and optional per-model usage when available.
 - `responseFormat: { type: 'json' }` is prompt-engineered, not native constrained decoding. The provider emits a compatibility warning; parsing or schema validation can still fail.
 - Textual file content can be mapped to ACP embedded resources. Images, audio, remote URLs, and arbitrary binary files are not supported by the captured Grok 0.2.99 ACP capabilities.
 

@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
 import { PassThrough } from "node:stream";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { AcpClient, NdjsonFramer, type AcpChildProcess } from "./client.js";
 import { AcpSpawnError } from "./errors.js";
 import type {
@@ -39,6 +39,7 @@ class FixtureChild extends EventEmitter implements AcpChildProcess {
   readonly killSignals: Array<NodeJS.Signals | number | undefined> = [];
   private readonly groups = new Map<string, unknown[]>();
   private readonly heldMethods: Set<string>;
+  private exited = false;
 
   constructor(rows: FixtureRow[], heldMethods: Iterable<string> = []) {
     super();
@@ -68,7 +69,9 @@ class FixtureChild extends EventEmitter implements AcpChildProcess {
         if (line) {
           this.receive(
             JSON.parse(line) as
-              JsonRpcRequest | JsonRpcNotification | JsonRpcResponse,
+              | JsonRpcRequest
+              | JsonRpcNotification
+              | JsonRpcResponse,
           );
         }
         newline = inputBuffer.indexOf("\n");
@@ -78,6 +81,14 @@ class FixtureChild extends EventEmitter implements AcpChildProcess {
 
   kill(signal?: NodeJS.Signals | number): boolean {
     this.killSignals.push(signal);
+    if (!this.exited) {
+      this.exited = true;
+      this.stdout.end();
+      this.stderr.end();
+      queueMicrotask(() =>
+        this.emit("exit", null, typeof signal === "string" ? signal : null),
+      );
+    }
     return true;
   }
 
@@ -91,7 +102,10 @@ class FixtureChild extends EventEmitter implements AcpChildProcess {
     signal: NodeJS.Signals | null = null,
   ): void {
     this.stderr.write(stderr);
+    this.exited = true;
     this.emit("exit", code, signal);
+    this.stdout.end();
+    this.stderr.end();
   }
 
   failToSpawn(error: NodeJS.ErrnoException): void {
@@ -141,6 +155,13 @@ class FixtureChild extends EventEmitter implements AcpChildProcess {
   }
 }
 
+class StubbornChild extends FixtureChild {
+  override kill(signal?: NodeJS.Signals | number): boolean {
+    this.killSignals.push(signal);
+    return true;
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -166,7 +187,7 @@ describe("NdjsonFramer", () => {
 });
 
 describe("AcpClient fixture replay", () => {
-  it("negotiates cached_token authentication by default", async () => {
+  it("uses cached CLI state without eager authentication", async () => {
     const child = new FixtureChild(readFixture("text-only.jsonl"));
     const client = new AcpClient({ spawn: () => child });
     await client.initialize();
@@ -175,12 +196,45 @@ describe("AcpClient fixture replay", () => {
       child.requests
         .filter((request) => "method" in request)
         .map((request) => request.method),
-    ).toEqual(["initialize", "authenticate"]);
-    expect(child.requests[1]).toMatchObject({
-      method: "authenticate",
-      params: { methodId: "cached_token" },
+    ).toEqual(["initialize"]);
+    await client.dispose();
+  });
+
+  it("authenticates and retries a session once after an auth failure", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/new",
+    ]);
+    const client = new AcpClient({ spawn: () => child });
+    const pending = client.newSession({ cwd: "/fixture", mcpServers: [] });
+    await new Promise((resolve) => setImmediate(resolve));
+    const firstSession = child.requests.find(
+      (request) => "method" in request && request.method === "session/new",
+    ) as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      id: firstSession.id,
+      error: { code: -32001, message: "Authentication required" },
     });
-    client.dispose();
+    await new Promise((resolve) => setImmediate(resolve));
+    const sessionRequests = child.requests.filter(
+      (request) => "method" in request && request.method === "session/new",
+    ) as JsonRpcRequest[];
+    expect(sessionRequests).toHaveLength(2);
+    child.send({
+      jsonrpc: "2.0",
+      id: sessionRequests[1]?.id,
+      result: { sessionId: "retried-session" },
+    });
+
+    await expect(pending).resolves.toMatchObject({
+      sessionId: "retried-session",
+    });
+    expect(
+      child.requests
+        .filter((request) => "method" in request)
+        .map((request) => request.method),
+    ).toEqual(["initialize", "session/new", "authenticate", "session/new"]);
+    await client.dispose();
   });
 
   it("replays text-only ACP with correlated results, updates, and extensions", async () => {
@@ -233,7 +287,7 @@ describe("AcpClient fixture replay", () => {
         .filter((request) => "method" in request)
         .map((request) => request.method),
     ).toEqual(["initialize", "session/new", "session/prompt"]);
-    client.dispose();
+    await client.dispose();
   });
 
   it("preserves captured tool input, xAI metadata, content, raw output, and usage", async () => {
@@ -281,7 +335,7 @@ describe("AcpClient fixture replay", () => {
       truncated: false,
     });
     expect(result.meta?.usage).toMatchObject({ modelCalls: 2, numTurns: 2 });
-    client.dispose();
+    await client.dispose();
   });
 
   it("frames arbitrarily split NDJSON across tool-call and extension boundaries", async () => {
@@ -378,7 +432,7 @@ describe("AcpClient fixture replay", () => {
     ]);
     expect(extensions).toContain("_x.ai/session_notification");
     expect(extensions.at(-1)).toBe("_x.ai/session_notification");
-    client.dispose();
+    await client.dispose();
   });
 
   it("routes unknown session/update variants without confusing xAI extensions", async () => {
@@ -413,7 +467,7 @@ describe("AcpClient fixture replay", () => {
 
     expect(updates).toEqual(["future_update"]);
     expect(extensions).toEqual(["_x.ai/future_notification"]);
-    client.dispose();
+    await client.dispose();
   });
 
   it("propagates AbortSignal as session/cancel and rejects the prompt", async () => {
@@ -443,7 +497,7 @@ describe("AcpClient fixture replay", () => {
       method: "session/cancel",
       params: { sessionId: session.sessionId },
     });
-    client.dispose();
+    await client.dispose();
   });
 
   it("capability-gates and sends the documented session/load request", async () => {
@@ -466,7 +520,67 @@ describe("AcpClient fixture replay", () => {
         mcpServers: [],
       },
     });
-    client.dispose();
+    await client.dispose();
+  });
+
+  it.each(["session/new", "session/load"] as const)(
+    "propagates abort through %s preparation",
+    async (method) => {
+      const child = new FixtureChild(readFixture("text-only.jsonl"), [method]);
+      const client = new AcpClient({ authMethod: false, spawn: () => child });
+      const controller = new AbortController();
+      const pending =
+        method === "session/new"
+          ? client.newSession(
+              { cwd: "/fixture", mcpServers: [] },
+              controller.signal,
+            )
+          : client.loadSession(
+              {
+                sessionId: "existing-session",
+                cwd: "/fixture",
+                mcpServers: [],
+              },
+              controller.signal,
+            );
+      await new Promise((resolve) => setImmediate(resolve));
+      controller.abort();
+
+      await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+      await client.dispose();
+    },
+  );
+
+  it("propagates abort through lazy authentication without retrying the session", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/new",
+      "authenticate",
+    ]);
+    const client = new AcpClient({ spawn: () => child });
+    const controller = new AbortController();
+    const pending = client.newSession(
+      { cwd: "/fixture", mcpServers: [] },
+      controller.signal,
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    const session = child.requests.find(
+      (request) => "method" in request && request.method === "session/new",
+    ) as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      id: session.id,
+      error: { code: -32001, message: "Authentication required" },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(
+      child.requests.filter(
+        (request) => "method" in request && request.method === "session/new",
+      ),
+    ).toHaveLength(1);
+    await client.dispose();
   });
 });
 
@@ -580,6 +694,72 @@ describe("AcpClient failures", () => {
     expect(client.failure?.message).toContain("agent crashed during prompt");
   });
 
+  it("correlates a buffered terminal response before reporting child exit", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/prompt",
+    ]);
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    const session = await client.newSession({
+      cwd: "/fixture",
+      mcpServers: [],
+    });
+    const pending = client.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "wait" }],
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    const request = child.requests.find(
+      (message) =>
+        "method" in message &&
+        message.method === "session/prompt" &&
+        "id" in message,
+    ) as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      id: request.id,
+      result: { stopReason: "end_turn", _meta: { outputTokens: 1 } },
+    });
+    child.emit("exit", 0, null);
+    child.stdout.end();
+
+    await expect(pending).resolves.toMatchObject({ stopReason: "end_turn" });
+  });
+
+  it("bounds shutdown and escalates from cancellation through SIGKILL", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = new StubbornChild(readFixture("text-only.jsonl"), [
+        "session/prompt",
+      ]);
+      const client = new AcpClient({ authMethod: false, spawn: () => child });
+      const session = await client.newSession({
+        cwd: "/fixture",
+        mcpServers: [],
+      });
+      const prompt = client.prompt({
+        sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "wait" }],
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      const rejection = expect(prompt).rejects.toMatchObject({
+        code: "CLIENT_DISPOSED",
+      });
+      const disposal = client.dispose();
+      await vi.runAllTimersAsync();
+      await disposal;
+      await rejection;
+
+      expect(child.requests).toContainEqual({
+        jsonrpc: "2.0",
+        method: "session/cancel",
+        params: { sessionId: session.sessionId },
+      });
+      expect(child.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("preserves an authentication-required initialize JSON-RPC response", async () => {
     const child = new FixtureChild(readFixture("text-only.jsonl"), [
       "initialize",
@@ -639,7 +819,7 @@ describe("AcpClient agent requests", () => {
       id: "permission-1",
       result: { outcome: { outcome: "selected", optionId: "allow" } },
     });
-    client.dispose();
+    await client.dispose();
   });
 
   it("returns a clear permission error in default mode", async () => {
@@ -669,7 +849,7 @@ describe("AcpClient agent requests", () => {
         ? response.error.message
         : "",
     ).toContain("reject (reject_once: Reject)");
-    client.dispose();
+    await client.dispose();
   });
 
   it("advertises and handles filesystem RPCs only when explicitly enabled", async () => {
@@ -702,7 +882,7 @@ describe("AcpClient agent requests", () => {
       id: "read-1",
       result: { content: "read:/fixture/file.txt" },
     });
-    client.dispose();
+    await client.dispose();
   });
 
   it("maps synchronous ENOENT spawn failures to AcpSpawnError with an install hint", async () => {

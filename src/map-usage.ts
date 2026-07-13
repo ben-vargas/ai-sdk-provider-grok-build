@@ -1,73 +1,59 @@
 import type {
   JSONObject,
-  JSONValue,
-  LanguageModelV4Usage,
-  SharedV4ProviderMetadata,
+  LanguageModelV3Usage,
+  SharedV3ProviderMetadata,
 } from "@ai-sdk/provider";
 import type {
-  AcpModelUsage,
-  AcpPromptResultMeta,
-  AcpPromptUsage,
-  AcpStopReason,
-} from "./acp/protocol.js";
+  NormalizedCompletionMetadata,
+  NormalizedUsage,
+} from "./normalized-usage.js";
 
-function jsonValue(value: unknown): JSONValue | undefined {
-  if (value === undefined) return undefined;
-  return JSON.parse(JSON.stringify(value)) as JSONValue;
-}
-
-function resolvedUsage(
-  meta?: AcpPromptResultMeta | null,
-): AcpPromptUsage | AcpModelUsage | undefined {
-  return (
-    meta?.usage ??
-    (meta && (meta.inputTokens !== undefined || meta.outputTokens !== undefined)
-      ? {
-          inputTokens: meta.inputTokens ?? 0,
-          outputTokens: meta.outputTokens ?? 0,
-          totalTokens: meta.totalTokens ?? 0,
-          cachedReadTokens: meta.cachedReadTokens,
-          reasoningTokens: meta.reasoningTokens,
-        }
-      : undefined)
-  );
-}
-
+/** Thin AI SDK V3 usage adapter over normalized ACP accounting. */
 export function mapGrokBuildUsage(
-  meta?: AcpPromptResultMeta | null,
-): LanguageModelV4Usage {
-  const usage = resolvedUsage(meta);
-  const input = usage?.inputTokens;
-  const cached = usage?.cachedReadTokens;
+  usage: NormalizedUsage,
+): LanguageModelV3Usage {
   return {
     inputTokens: {
-      total: input,
-      noCache:
-        input === undefined ? undefined : Math.max(0, input - (cached ?? 0)),
-      cacheRead: cached,
+      total: usage.inputTotal,
+      noCache: undefined,
+      cacheRead: usage.cacheRead,
       cacheWrite: undefined,
     },
     outputTokens: {
-      total: usage?.outputTokens,
+      total: usage.outputTotal,
       text: undefined,
-      reasoning: usage?.reasoningTokens,
+      reasoning: usage.reasoning,
     },
-    raw: usage ? (jsonValue(usage) as JSONObject) : undefined,
+    raw:
+      usage.raw && typeof usage.raw === "object" && !Array.isArray(usage.raw)
+        ? (usage.raw as JSONObject)
+        : undefined,
   };
 }
 
 export function grokBuildProviderMetadata(
-  meta: AcpPromptResultMeta | null | undefined,
-  stopReason: AcpStopReason,
-  fallbackSessionId: string,
-): SharedV4ProviderMetadata {
-  const modelUsage = meta?.usage?.modelUsage;
+  metadata: NormalizedCompletionMetadata,
+): SharedV3ProviderMetadata {
   return {
     "grok-build": {
-      sessionId: meta?.sessionId ?? fallbackSessionId,
-      ...(meta?.requestId ? { requestId: meta.requestId } : {}),
-      ...(modelUsage ? { modelUsage: jsonValue(modelUsage) } : {}),
-      stopReason,
+      sessionId: metadata.sessionId,
+      ...(metadata.requestId ? { requestId: metadata.requestId } : {}),
+      ...(metadata.promptId ? { promptId: metadata.promptId } : {}),
+      stopReason: metadata.stopReason,
+      resolvedModel: metadata.resolvedModel,
+      ...(metadata.availableModels
+        ? { availableModels: metadata.availableModels }
+        : {}),
+      ...(metadata.currentReasoningEffort
+        ? { currentReasoningEffort: metadata.currentReasoningEffort }
+        : {}),
+      ...(metadata.supportedReasoningEfforts
+        ? {
+            supportedReasoningEfforts: metadata.supportedReasoningEfforts,
+          }
+        : {}),
+      ...(metadata.agentVersion ? { agentVersion: metadata.agentVersion } : {}),
+      ...(metadata.modelUsage ? { modelUsage: metadata.modelUsage } : {}),
     },
   };
 }

@@ -6,7 +6,7 @@ const result = await generateText({
   prompt: "Reply with exactly three words about testing.",
 });
 
-const metadata = result.finalStep.providerMetadata?.["grok-build"];
+const metadata = result.providerMetadata?.["grok-build"];
 
 console.log("Text:", result.text.trim());
 console.log("Usage:", {

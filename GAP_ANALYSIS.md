@@ -13,7 +13,7 @@ The main branch targets:
 - Node.js 22 or newer
 - ESM only
 
-The future `ai-sdk-v6` branch will use `LanguageModelV3` / `ProviderV3`. The ACP process, JSON-RPC client, session state, normalized events, usage model, and cancellation machinery must not import either adapter generation.
+This `ai-sdk-v6` branch uses `LanguageModelV3` / `ProviderV3`, `@ai-sdk/provider ^3`, `@ai-sdk/provider-utils ^4`, Node.js 18 or newer, and dual ESM/CommonJS output. The ACP process, JSON-RPC client, session state, normalized events, usage model, and cancellation machinery do not import either adapter generation.
 
 ## Dispositions
 
@@ -222,7 +222,7 @@ The initial provider ships with these gaps visible. They are not hidden behind b
 - **Session load is advertised, not proven.** New sessions and IDs work; restart replay, invalid IDs, cross-CWD behavior, and concurrent prompts remain limited.
 - **Interactive permissions are not yet proven.** Always-approve and live request handling are capability-gated; AI SDK's deferred approval parts do not match ACP's immediate RPC response.
 - **Prompt-history roles are lossy on fresh sessions.** System, assistant, reasoning, and tool history are serialized as text because ACP prompt content has no role-history import.
-- **Usage is detailed but not complete.** Cache reads and reasoning tokens map; cache writes, no-cache input, and independent text-output tokens remain unknown.
+- **Usage is detailed but not complete.** Cache reads and reasoning tokens map; cache writes, no-cache input, and independent text-output tokens remain `undefined`. No-cache input is not derived because the captured traces do not prove whether total input includes cached reads.
 - **No source, generated-file, reasoning-file, or V4 custom-content events.** Tool output and xAI extensions stay tool/raw metadata rather than being relabeled.
 - **No HTTP request surface.** Generic headers, response headers, proxies, and request/response bodies do not apply to stdio; MCP headers and process proxy environment are configured explicitly.
 - **ACP extension drift remains a compatibility risk.** Unknown optional records are preserved as redacted raw events. Unknown completion, tool-identity, or permission events fail clearly rather than being discarded.

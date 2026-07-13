@@ -1,7 +1,7 @@
 {
   "name": "ai-sdk-provider-grok-build",
   "version": "0.1.0",
-  "description": "AI SDK v7 provider for the xAI Grok Build CLI over ACP",
+  "description": "AI SDK v6 provider for the xAI Grok Build CLI over ACP",
   "keywords": [
     "ai-sdk",
     "grok-build",
@@ -24,12 +24,20 @@
   "author": "Ben Vargas",
   "type": "module",
   "sideEffects": false,
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
     "./package.json": "./package.json",
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
     }
   },
   "files": [
@@ -54,29 +62,31 @@
     "validate": "npm run build && npm run typecheck && npm run format && npm run lint && npm run test"
   },
   "dependencies": {
-    "@ai-sdk/provider": "^4.0.2",
-    "@ai-sdk/provider-utils": "^5.0.5"
+    "@ai-sdk/provider": "^3.0.0",
+    "@ai-sdk/provider-utils": "^4.0.1"
   },
   "devDependencies": {
     "@eslint/js": "^9.28.0",
-    "@types/node": "^22.10.0",
+    "@types/node": "20.19.41",
     "@vitest/coverage-v8": "^3.2.4",
+    "ai": "^6.0.3",
     "eslint": "^9.28.0",
     "globals": "^16.2.0",
     "prettier": "^3.6.2",
     "tsup": "8.5.1",
     "typescript": "5.6.3",
     "typescript-eslint": "^8.34.0",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "zod": "^4.1.8"
   },
   "peerDependencies": {
-    "ai": "^7.0.16",
-    "zod": "^4"
+    "zod": "^3.0.0 || ^4.0.0"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=18"
   },
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "tag": "ai-sdk-v6"
   }
 }

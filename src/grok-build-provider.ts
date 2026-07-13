@@ -1,4 +1,4 @@
-import type { LanguageModelV4, ProviderV4 } from "@ai-sdk/provider";
+import type { LanguageModelV3, ProviderV3 } from "@ai-sdk/provider";
 import { NoSuchModelError } from "@ai-sdk/provider";
 import { GrokBuildLanguageModel } from "./grok-build-language-model.js";
 import {
@@ -7,13 +7,13 @@ import {
   type GrokBuildSettings,
 } from "./settings.js";
 
-export interface GrokBuildProvider extends ProviderV4 {
-  (modelId?: string, settings?: GrokBuildSettings): LanguageModelV4;
+export interface GrokBuildProvider extends ProviderV3 {
+  (modelId?: string, settings?: GrokBuildSettings): LanguageModelV3;
   languageModel(
     modelId?: string,
     settings?: GrokBuildSettings,
-  ): LanguageModelV4;
-  chat(modelId?: string, settings?: GrokBuildSettings): LanguageModelV4;
+  ): LanguageModelV3;
+  chat(modelId?: string, settings?: GrokBuildSettings): LanguageModelV3;
   embeddingModel(modelId: string): never;
   imageModel(modelId: string): never;
 }
@@ -26,7 +26,7 @@ export function createGrokBuild(
   const createModel = (
     modelId = defaults.defaultModel ?? "default",
     modelSettings: GrokBuildSettings = {},
-  ): LanguageModelV4 => {
+  ): LanguageModelV3 => {
     if (!modelId.trim()) {
       throw new NoSuchModelError({ modelId, modelType: "languageModel" });
     }
@@ -39,7 +39,7 @@ export function createGrokBuild(
   const provider = function grokBuildModel(
     modelId?: string,
     modelSettings?: GrokBuildSettings,
-  ): LanguageModelV4 {
+  ): LanguageModelV3 {
     if (new.target) {
       throw new Error(
         "The Grok Build model function cannot be called with the new keyword.",
@@ -48,7 +48,7 @@ export function createGrokBuild(
     return createModel(modelId, modelSettings);
   };
 
-  provider.specificationVersion = "v4" as const;
+  provider.specificationVersion = "v3" as const;
   provider.languageModel = createModel;
   provider.chat = createModel;
   provider.embeddingModel = (modelId: string): never => {

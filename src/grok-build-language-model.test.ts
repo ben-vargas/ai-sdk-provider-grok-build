@@ -2,11 +2,11 @@ import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
 import { PassThrough } from "node:stream";
 import type {
-  LanguageModelV4CallOptions,
-  LanguageModelV4StreamPart,
+  LanguageModelV3CallOptions,
+  LanguageModelV3StreamPart,
 } from "@ai-sdk/provider";
 import { APICallError } from "@ai-sdk/provider";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   AcpClient,
   type AcpChildProcess,
@@ -44,6 +44,7 @@ class FixtureChild extends EventEmitter implements AcpChildProcess {
   readonly killSignals: Array<NodeJS.Signals | number | undefined> = [];
   private readonly groups = new Map<string, unknown[]>();
   private readonly heldMethods: Set<string>;
+  private exited = false;
 
   constructor(rows: FixtureRow[], heldMethods: Iterable<string> = []) {
     super();
@@ -77,6 +78,14 @@ class FixtureChild extends EventEmitter implements AcpChildProcess {
 
   kill(signal?: NodeJS.Signals | number): boolean {
     this.killSignals.push(signal);
+    if (!this.exited) {
+      this.exited = true;
+      this.stdout.end();
+      this.stderr.end();
+      queueMicrotask(() =>
+        this.emit("exit", null, typeof signal === "string" ? signal : null),
+      );
+    }
     return true;
   }
 
@@ -122,8 +131,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function promptOptions(
   text: string,
-  extra: Partial<LanguageModelV4CallOptions> = {},
-): LanguageModelV4CallOptions {
+  extra: Partial<LanguageModelV3CallOptions> = {},
+): LanguageModelV3CallOptions {
   return {
     prompt: [{ role: "user", content: [{ type: "text", text }] }],
     ...extra,
@@ -134,13 +143,14 @@ function fixtureModel(
   name: string,
   includeRawChunks = false,
   heldMethods: Iterable<string> = [],
+  modelId = "grok-4.5",
 ): {
   model: GrokBuildLanguageModel;
   child: FixtureChild;
 } {
   const child = new FixtureChild(readFixture(name), heldMethods);
   const model = new GrokBuildLanguageModel({
-    id: "grok-4.5",
+    id: modelId,
     settings: { cwd: "/fixture", includeRawChunks },
     clientFactory: (options: AcpClientOptions) =>
       new AcpClient({
@@ -153,15 +163,15 @@ function fixtureModel(
 }
 
 async function collect(
-  stream: ReadableStream<LanguageModelV4StreamPart>,
-): Promise<LanguageModelV4StreamPart[]> {
-  const parts: LanguageModelV4StreamPart[] = [];
+  stream: ReadableStream<LanguageModelV3StreamPart>,
+): Promise<LanguageModelV3StreamPart[]> {
+  const parts: LanguageModelV3StreamPart[] = [];
   for await (const part of stream) parts.push(part);
   return parts;
 }
 
 describe("GrokBuildLanguageModel", () => {
-  it("maps the captured ACP tool lifecycle into a complete V4 stream", async () => {
+  it("maps the captured ACP tool lifecycle into a complete V3 stream", async () => {
     const { model } = fixtureModel("tool-use.jsonl", true);
     const result = await model.doStream(promptOptions("inspect"));
     const parts = await collect(result.stream);
@@ -219,17 +229,26 @@ describe("GrokBuildLanguageModel", () => {
       finishReason: { unified: "stop", raw: "end_turn" },
       usage: {
         inputTokens: {
-          total: 31997,
-          noCache: 10365,
-          cacheRead: 21632,
+          total: 16297,
+          noCache: undefined,
+          cacheRead: 15616,
         },
-        outputTokens: { total: 235, reasoning: 165 },
+        outputTokens: { total: 82, reasoning: 15 },
       },
       providerMetadata: {
         "grok-build": {
           sessionId: "019f58fd-189a-7f03-9fe2-e018704940ee",
           requestId: "a1f2fec5-c648-4228-8ea3-67e8c165d8a2",
+          promptId: "a1f2fec5-c648-4228-8ea3-67e8c165d8a2",
           stopReason: "end_turn",
+          resolvedModel: "grok-4.5",
+          currentReasoningEffort: "high",
+          supportedReasoningEfforts: ["high", "medium", "low"],
+          agentVersion: "0.2.99",
+          availableModels: expect.arrayContaining([
+            expect.objectContaining({ modelId: "grok-4.5" }),
+            expect.objectContaining({ modelId: "grok-composer-2.5-fast" }),
+          ]),
           modelUsage: { "grok-4.5": { modelCalls: 2 } },
         },
       },
@@ -252,8 +271,6 @@ describe("GrokBuildLanguageModel", () => {
       "reasoning",
       "tool-call",
       "tool-result",
-      "tool-result",
-      "tool-result",
       "reasoning",
       "text",
     ]);
@@ -264,7 +281,15 @@ describe("GrokBuildLanguageModel", () => {
         .join(""),
     ).toContain("Both confirmed");
     expect(result.finishReason).toEqual({ unified: "stop", raw: "end_turn" });
-    expect(result.usage.outputTokens.reasoning).toBe(165);
+    expect(result.usage.outputTokens.reasoning).toBe(15);
+    const generatedToolResults = result.content.filter(
+      (part) => part.type === "tool-result",
+    );
+    expect(generatedToolResults).toHaveLength(1);
+    expect(generatedToolResults[0]).toMatchObject({
+      result: { exit_code: 0, truncated: false },
+    });
+    expect(generatedToolResults[0]).not.toHaveProperty("preliminary");
     expect(result.warnings).toEqual([]);
   });
 
@@ -311,7 +336,9 @@ describe("GrokBuildLanguageModel", () => {
     );
     expect(
       generated.content.filter((part) => part.type === "tool-result"),
-    ).toEqual(parts.filter((part) => part.type === "tool-result"));
+    ).toEqual(
+      parts.filter((part) => part.type === "tool-result" && !part.preliminary),
+    );
     expect(finish).toMatchObject({
       type: "finish",
       finishReason: generated.finishReason,
@@ -400,7 +427,7 @@ describe("GrokBuildLanguageModel", () => {
     if (error instanceof Error) {
       expect(error.message).toContain("Invalid JSON from Grok ACP stdout");
     }
-    expect(child.killSignals).toContain("SIGTERM");
+    await vi.waitFor(() => expect(child.killSignals).toContain("SIGTERM"));
   });
 
   it("cancels ACP and closes cleanly when the stream consumer aborts mid-prompt", async () => {
@@ -439,6 +466,50 @@ describe("GrokBuildLanguageModel", () => {
             : undefined,
       },
     });
+    await vi.waitFor(() => expect(child.killSignals).toContain("SIGTERM"));
+  });
+
+  it("does not spawn for an already-aborted call", async () => {
+    let spawned = false;
+    const controller = new AbortController();
+    controller.abort();
+    const model = new GrokBuildLanguageModel({
+      id: "grok-4.5",
+      clientFactory: (options) =>
+        new AcpClient({
+          ...options,
+          spawn: () => {
+            spawned = true;
+            return new FixtureChild(readFixture("text-only.jsonl"));
+          },
+        }),
+    });
+
+    await expect(
+      model.doStream(
+        promptOptions("cancelled", { abortSignal: controller.signal }),
+      ),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(spawned).toBe(false);
+  });
+
+  it("aborts ACP initialization and disposes before creating a session", async () => {
+    const { model, child } = fixtureModel("text-only.jsonl", false, [
+      "initialize",
+    ]);
+    const controller = new AbortController();
+    const pending = model.doStream(
+      promptOptions("cancelled", { abortSignal: controller.signal }),
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(
+      child.requests.some(
+        (request) => "method" in request && request.method === "session/new",
+      ),
+    ).toBe(false);
     expect(child.killSignals).toContain("SIGTERM");
   });
 
@@ -467,7 +538,7 @@ describe("GrokBuildLanguageModel", () => {
             {
               type: "file",
               mediaType: "image/png",
-              data: { type: "data", data: "aW1hZ2U=" },
+              data: "aW1hZ2U=",
             },
           ],
         },
@@ -529,6 +600,30 @@ describe("GrokBuildLanguageModel", () => {
     );
   });
 
+  it("warns when a requested model is absent from the advertised catalog", async () => {
+    const { model } = fixtureModel(
+      "text-only.jsonl",
+      false,
+      [],
+      "not-a-grok-model",
+    );
+    const result = await model.doGenerate(promptOptions("ping"));
+
+    expect(result.warnings).toContainEqual(
+      expect.objectContaining({
+        type: "unsupported",
+        feature: "model selection",
+        details: expect.stringContaining("not present"),
+      }),
+    );
+    expect(result.providerMetadata?.["grok-build"]).toMatchObject({
+      resolvedModel: "grok-4.5",
+      availableModels: expect.arrayContaining([
+        expect.objectContaining({ modelId: "grok-4.5" }),
+      ]),
+    });
+  });
+
   it.each([
     { unknown: true },
     { reasoningEffort: "extreme" },
@@ -566,4 +661,15 @@ describe("GrokBuildLanguageModel", () => {
       expect(spawned).toBe(false);
     },
   );
+
+  it("validates public constructor settings and model IDs before spawning", () => {
+    expect(() => new GrokBuildLanguageModel({ id: "   " })).toThrow();
+    expect(
+      () =>
+        new GrokBuildLanguageModel({
+          id: "grok-4.5",
+          settings: { timeouts: { requestMs: 0 } },
+        }),
+    ).toThrow();
+  });
 });

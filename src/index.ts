@@ -25,7 +25,21 @@ export type {
   AcpSseMcpServer,
   AcpStdioMcpServer,
 } from "./acp/protocol.js";
-export type { PermissionMode } from "./acp/client.js";
+export {
+  AcpClient,
+  NdjsonFramer,
+  type AcpChildProcess,
+  type AcpClientOptions,
+  type AcpFileSystemSettings,
+  type AcpPromptOptions,
+  type AcpPromptOutcome,
+  type AcpSpawnFactory,
+  type AcpSpawnOptions,
+  type PermissionMode,
+  type PermissionHandler,
+  type ReadTextFileHandler,
+  type WriteTextFileHandler,
+} from "./acp/client.js";
 export {
   createGrokBuildAuthenticationError,
   isMissingExecutableError,

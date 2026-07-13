@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Initial AI SDK v7 `LanguageModelV4` / `ProviderV4` provider for Grok Build.
+- Initial AI SDK v6 `LanguageModelV3` / `ProviderV3` provider for Grok Build.
 - ACP protocol v1 transport over `grok --no-auto-update agent stdio`, including JSON-RPC request correlation, NDJSON framing, cancellation, process cleanup, and typed errors.
 - Cached Grok CLI authentication through ACP `cached_token` by default, with explicit `XAI_API_KEY` support through `authMethod: 'api_key'`.
 - Streaming and non-streaming assistant text, reasoning, provider-executed Grok tool calls/results, finish reasons, usage, and provider metadata.
@@ -20,6 +20,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Compatibility
 
-- Requires Node.js 22 or newer, AI SDK `^7.0.16`, `@ai-sdk/provider ^4.0.2`, `@ai-sdk/provider-utils ^5.0.5`, and Zod 4.
-- ESM-only package output.
+- Requires Node.js 18 or newer, AI SDK 6 for integration, `@ai-sdk/provider ^3`, and `@ai-sdk/provider-utils ^4`; supports Zod 3 or 4.
+- Dual ESM and CommonJS package output.
 - Validated against captured Grok Build 0.2.99 ACP traffic.

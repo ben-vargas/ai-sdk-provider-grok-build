@@ -7,7 +7,4 @@ const result = await generateText({
 });
 
 console.log(result.text.trim());
-console.log(
-  "Session:",
-  result.finalStep.providerMetadata?.["grok-build"]?.sessionId,
-);
+console.log("Session:", result.providerMetadata?.["grok-build"]?.sessionId);

@@ -6,7 +6,7 @@ const first = await generateText({
   prompt: "Remember the word papaya. Reply only: OK",
 });
 
-const sessionId = first.finalStep.providerMetadata?.["grok-build"]?.sessionId;
+const sessionId = first.providerMetadata?.["grok-build"]?.sessionId;
 if (typeof sessionId !== "string") {
   throw new Error("The first call returned no grok-build sessionId.");
 }

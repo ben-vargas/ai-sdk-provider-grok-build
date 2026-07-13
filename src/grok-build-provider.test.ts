@@ -3,12 +3,12 @@ import { describe, expect, it } from "vitest";
 import { createGrokBuild, grokBuild } from "./grok-build-provider.js";
 
 describe("createGrokBuild", () => {
-  it("creates callable, languageModel, and chat V4 model factories", () => {
+  it("creates callable, languageModel, and chat V3 model factories", () => {
     const provider = createGrokBuild({ defaultModel: "grok-4.5" });
-    expect(provider.specificationVersion).toBe("v4");
+    expect(provider.specificationVersion).toBe("v3");
     expect(provider().modelId).toBe("grok-4.5");
     expect(provider.languageModel("grok-composer-2.5-fast")).toMatchObject({
-      specificationVersion: "v4",
+      specificationVersion: "v3",
       provider: "grok-build",
       modelId: "grok-composer-2.5-fast",
       supportedUrls: {},

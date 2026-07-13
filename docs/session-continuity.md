@@ -15,7 +15,7 @@ const first = await generateText({
   prompt: "Review the project and remember the two highest-risk files.",
 });
 
-const sessionId = first.finalStep.providerMetadata?.["grok-build"]?.sessionId;
+const sessionId = first.providerMetadata?.["grok-build"]?.sessionId;
 if (typeof sessionId !== "string") {
   throw new Error("Missing Grok Build session ID");
 }

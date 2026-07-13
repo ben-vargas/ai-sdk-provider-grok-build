@@ -1,14 +1,14 @@
 import { resolve } from "node:path";
 import type {
-  LanguageModelV4,
-  LanguageModelV4CallOptions,
-  LanguageModelV4Content,
-  LanguageModelV4GenerateResult,
-  LanguageModelV4ResponseMetadata,
-  LanguageModelV4StreamPart,
-  LanguageModelV4StreamResult,
-  SharedV4ProviderMetadata,
-  SharedV4Warning,
+  LanguageModelV3,
+  LanguageModelV3CallOptions,
+  LanguageModelV3Content,
+  LanguageModelV3GenerateResult,
+  LanguageModelV3ResponseMetadata,
+  LanguageModelV3StreamPart,
+  LanguageModelV3StreamResult,
+  SharedV3ProviderMetadata,
+  SharedV3Warning,
 } from "@ai-sdk/provider";
 import { APICallError } from "@ai-sdk/provider";
 import { parseProviderOptions } from "@ai-sdk/provider-utils";
@@ -22,13 +22,20 @@ import type {
 import { mapAcpError, missingApiKeyError } from "./errors.js";
 import { mapGrokBuildFinishReason } from "./map-finish-reason.js";
 import { mapGrokBuildCallWarnings, mapGrokBuildPrompt } from "./map-prompt.js";
+import {
+  normalizeAcpUsage,
+  normalizeCompletionMetadata,
+  type NormalizedSessionMetadata,
+} from "./normalized-usage.js";
 import { grokBuildProviderMetadata, mapGrokBuildUsage } from "./map-usage.js";
-import { GrokBuildV4StreamEmitter } from "./map-v4-events.js";
+import { GrokBuildV3StreamEmitter } from "./map-v3-events.js";
 import {
   grokBuildProviderOptionsSchema,
   type GrokBuildLogger,
   type GrokBuildProviderOptions,
   type GrokBuildSettings,
+  validateGrokBuildModelId,
+  validateGrokBuildSettings,
 } from "./settings.js";
 
 export type AcpClientFactory = (options: AcpClientOptions) => AcpClient;
@@ -43,7 +50,7 @@ interface PreparedCall {
   client: AcpClient;
   sessionId: string;
   prompt: Awaited<ReturnType<typeof mapGrokBuildPrompt>>["prompt"];
-  warnings: SharedV4Warning[];
+  warnings: SharedV3Warning[];
   includeRawChunks: boolean;
   extensionEvents: AcpExtensionNotification[];
   attachExtensionConsumer(
@@ -51,6 +58,7 @@ interface PreparedCall {
   ): void;
   promptTimeoutMs?: number;
   resolvedModelId: string;
+  sessionMetadata: NormalizedSessionMetadata;
 }
 
 const noopLogger: GrokBuildLogger = {
@@ -79,13 +87,9 @@ function currentReasoningEffort(
 }
 
 function requestedReasoningEffort(
-  options: LanguageModelV4CallOptions,
   providerOptions: GrokBuildProviderOptions | undefined,
 ): string | undefined {
-  if (providerOptions?.reasoningEffort) return providerOptions.reasoningEffort;
-  return options.reasoning && options.reasoning !== "provider-default"
-    ? options.reasoning
-    : undefined;
+  return providerOptions?.reasoningEffort;
 }
 
 function sessionResultModels(
@@ -96,8 +100,16 @@ function sessionResultModels(
     : undefined;
 }
 
-export class GrokBuildLanguageModel implements LanguageModelV4 {
-  readonly specificationVersion = "v4" as const;
+function throwIfAborted(signal: AbortSignal): void {
+  if (!signal.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  const error = new Error("The Grok Build call was aborted.");
+  error.name = "AbortError";
+  throw error;
+}
+
+export class GrokBuildLanguageModel implements LanguageModelV3 {
+  readonly specificationVersion = "v3" as const;
   readonly provider = "grok-build";
   readonly supportedUrls = {};
   readonly modelId: string;
@@ -107,8 +119,8 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
   private readonly clientFactory: AcpClientFactory;
 
   constructor(options: GrokBuildLanguageModelOptions) {
-    this.modelId = options.id;
-    this.settings = options.settings ?? {};
+    this.modelId = validateGrokBuildModelId(options.id);
+    this.settings = validateGrokBuildSettings(options.settings ?? {});
     this.logger = this.settings.logger ?? noopLogger;
     this.clientFactory =
       options.clientFactory ??
@@ -116,16 +128,17 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
   }
 
   async doGenerate(
-    options: LanguageModelV4CallOptions,
-  ): Promise<LanguageModelV4GenerateResult> {
+    options: LanguageModelV3CallOptions,
+  ): Promise<LanguageModelV3GenerateResult> {
     const { stream } = await this.doStream(options);
-    const content: LanguageModelV4Content[] = [];
+    const content: LanguageModelV3Content[] = [];
     const contentIndexes = new Map<string, number>();
-    let warnings: SharedV4Warning[] = [];
-    let finishReason: LanguageModelV4GenerateResult["finishReason"] | undefined;
-    let usage: LanguageModelV4GenerateResult["usage"] | undefined;
-    let metadata: SharedV4ProviderMetadata | undefined;
-    let response: LanguageModelV4ResponseMetadata | undefined;
+    const toolResultIndexes = new Map<string, number>();
+    let warnings: SharedV3Warning[] = [];
+    let finishReason: LanguageModelV3GenerateResult["finishReason"] | undefined;
+    let usage: LanguageModelV3GenerateResult["usage"] | undefined;
+    let metadata: SharedV3ProviderMetadata | undefined;
+    let response: LanguageModelV3ResponseMetadata | undefined;
 
     for await (const part of stream) {
       switch (part.type) {
@@ -172,14 +185,26 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
           break;
         }
         case "tool-call":
-        case "tool-result":
         case "tool-approval-request":
-        case "custom":
         case "file":
-        case "reasoning-file":
         case "source":
           content.push(part);
           break;
+        case "tool-result": {
+          const previousIndex = toolResultIndexes.get(part.toolCallId);
+          const previous =
+            previousIndex === undefined ? undefined : content[previousIndex];
+          if (previousIndex === undefined) {
+            toolResultIndexes.set(part.toolCallId, content.length);
+            content.push(part);
+          } else if (
+            previous?.type === "tool-result" &&
+            previous.preliminary === true
+          ) {
+            content[previousIndex] = part;
+          }
+          break;
+        }
         case "finish":
           finishReason = part.finishReason;
           usage = part.usage;
@@ -212,15 +237,8 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
   }
 
   async doStream(
-    options: LanguageModelV4CallOptions,
-  ): Promise<LanguageModelV4StreamResult> {
-    let prepared: PreparedCall;
-    try {
-      prepared = await this.prepareCall(options);
-    } catch (error) {
-      throw mapAcpError(error, { modelId: this.modelId });
-    }
-
+    options: LanguageModelV3CallOptions,
+  ): Promise<LanguageModelV3StreamResult> {
     const abortController = new AbortController();
     const forwardAbort = (): void =>
       abortController.abort(options.abortSignal?.reason);
@@ -230,11 +248,26 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
         once: true,
       });
 
-    const stream = new ReadableStream<LanguageModelV4StreamPart>({
+    let prepared: PreparedCall;
+    try {
+      throwIfAborted(abortController.signal);
+      prepared = await this.prepareCall(options, abortController.signal);
+    } catch (error) {
+      options.abortSignal?.removeEventListener("abort", forwardAbort);
+      throw mapAcpError(error, { modelId: this.modelId });
+    }
+
+    const stream = new ReadableStream<LanguageModelV3StreamPart>({
       start: (controller) => {
-        const emitter = new GrokBuildV4StreamEmitter(
+        const emitter = new GrokBuildV3StreamEmitter(
           controller,
           prepared.includeRawChunks,
+          (warning) =>
+            this.logger.warn(
+              warning.type === "compatibility"
+                ? (warning.details ?? warning.feature)
+                : "ACP compatibility warning",
+            ),
         );
         emitter.emitStart(prepared.warnings, prepared.resolvedModelId);
         for (const event of prepared.extensionEvents)
@@ -261,11 +294,13 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
           .then((outcome) => {
             emitter.emitFinish(
               mapGrokBuildFinishReason(outcome.stopReason),
-              mapGrokBuildUsage(outcome.meta),
+              mapGrokBuildUsage(normalizeAcpUsage(outcome.meta)),
               grokBuildProviderMetadata(
-                outcome.meta,
-                outcome.stopReason,
-                prepared.sessionId,
+                normalizeCompletionMetadata(
+                  outcome.meta,
+                  outcome.stopReason,
+                  prepared.sessionMetadata,
+                ),
               ),
             );
             emitter.close();
@@ -273,9 +308,9 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
           .catch((error: unknown) => {
             emitter.error(mapAcpError(error, { modelId: this.modelId }));
           })
-          .finally(() => {
+          .finally(async () => {
             options.abortSignal?.removeEventListener("abort", forwardAbort);
-            prepared.client.dispose();
+            await prepared.client.dispose();
           });
       },
       cancel: (reason) => {
@@ -287,12 +322,15 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
   }
 
   private async prepareCall(
-    options: LanguageModelV4CallOptions,
+    options: LanguageModelV3CallOptions,
+    signal: AbortSignal,
   ): Promise<PreparedCall> {
+    throwIfAborted(signal);
     const mappedPrompt = await mapGrokBuildPrompt(
       options.prompt,
       options.responseFormat,
     );
+    throwIfAborted(signal);
     const warnings = [
       ...mapGrokBuildCallWarnings(options),
       ...mappedPrompt.warnings,
@@ -303,6 +341,7 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
         providerOptions: options.providerOptions,
         schema: grokBuildProviderOptionsSchema,
       });
+    throwIfAborted(signal);
 
     if (providerOptions?.maxTurns !== undefined) {
       warnings.push({
@@ -365,7 +404,7 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
     });
 
     try {
-      const initialized = await client.initialize();
+      const initialized = await client.initialize(signal);
       const cwd = resolve(this.settings.cwd ?? process.cwd());
       const mcpServers = mergeMcpServers(
         this.settings.mcpServers,
@@ -380,11 +419,14 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
       let models: AcpModelState | undefined;
 
       if (shouldLoad && sourceSessionId) {
-        const result = await client.loadSession({
-          sessionId: sourceSessionId,
-          cwd,
-          mcpServers,
-        });
+        const result = await client.loadSession(
+          {
+            sessionId: sourceSessionId,
+            cwd,
+            mcpServers,
+          },
+          signal,
+        );
         sessionId = sourceSessionId;
         models = sessionResultModels(result);
         warnings.push({
@@ -394,7 +436,7 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
             "Grok advertises session/load, but replay ordering and cross-CWD behavior are not fixture-verified.",
         });
       } else {
-        const result = await client.newSession({ cwd, mcpServers });
+        const result = await client.newSession({ cwd, mcpServers }, signal);
         sessionId = result.sessionId;
         models = result.models;
       }
@@ -402,7 +444,19 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
 
       const requestedModel = providerOptions?.model ?? this.modelId;
       const resolvedModelId = models?.currentModelId ?? requestedModel;
-      if (requestedModel !== "default" && requestedModel !== resolvedModelId) {
+      const requestedModelAvailable = models?.availableModels.some(
+        (model) => model.modelId === requestedModel,
+      );
+      if (requestedModel !== "default" && models && !requestedModelAvailable) {
+        warnings.push({
+          type: "unsupported",
+          feature: "model selection",
+          details: `Requested model '${requestedModel}' is not present in Grok's advertised model catalog; ACP resolved '${resolvedModelId}'.`,
+        });
+      } else if (
+        requestedModel !== "default" &&
+        requestedModel !== resolvedModelId
+      ) {
         warnings.push({
           type: "compatibility",
           feature: "model selection",
@@ -410,7 +464,7 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
         });
       }
 
-      const effort = requestedReasoningEffort(options, providerOptions);
+      const effort = requestedReasoningEffort(providerOptions);
       if (effort) {
         const available = models?.availableModels
           .find((model) => model.modelId === models?.currentModelId)
@@ -434,6 +488,10 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
       this.logger.debug(
         `Grok ACP session ${sessionId} prepared with model ${resolvedModelId}.`,
       );
+      const currentEffort = currentReasoningEffort(models);
+      const supportedEfforts = models?.availableModels
+        .find((model) => model.modelId === resolvedModelId)
+        ?._meta?.reasoningEfforts?.map((item) => item.value);
       return {
         client,
         sessionId,
@@ -446,9 +504,17 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
         },
         promptTimeoutMs: this.settings.timeouts?.promptMs,
         resolvedModelId,
+        sessionMetadata: {
+          sessionId,
+          resolvedModelId,
+          availableModels: models?.availableModels,
+          currentReasoningEffort: currentEffort,
+          supportedReasoningEfforts: supportedEfforts,
+          agentVersion: initialized._meta?.agentVersion,
+        },
       };
     } catch (error) {
-      client.dispose();
+      await client.dispose();
       throw error;
     }
   }

@@ -1,25 +1,24 @@
 import { promises as fs } from "node:fs";
-import { isAbsolute } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import type {
-  LanguageModelV4CallOptions,
-  LanguageModelV4FilePart,
-  LanguageModelV4Prompt,
-  LanguageModelV4ToolResultOutput,
-  SharedV4Warning,
+  LanguageModelV3CallOptions,
+  LanguageModelV3FilePart,
+  LanguageModelV3Prompt,
+  LanguageModelV3ToolResultOutput,
+  SharedV3Warning,
 } from "@ai-sdk/provider";
 import type { AcpContentBlock } from "./acp/protocol.js";
 
 export interface MappedGrokBuildPrompt {
   prompt: AcpContentBlock[];
-  warnings: SharedV4Warning[];
+  warnings: SharedV3Warning[];
 }
 
-function unsupported(feature: string, details: string): SharedV4Warning {
+function unsupported(feature: string, details: string): SharedV3Warning {
   return { type: "unsupported", feature, details };
 }
 
-function compatibility(feature: string, details: string): SharedV4Warning {
+function compatibility(feature: string, details: string): SharedV3Warning {
   return { type: "compatibility", feature, details };
 }
 
@@ -31,7 +30,7 @@ function safeStringify(value: unknown): string {
   }
 }
 
-function toolOutputText(output: LanguageModelV4ToolResultOutput): string {
+function toolOutputText(output: LanguageModelV3ToolResultOutput): string {
   switch (output.type) {
     case "text":
     case "error-text":
@@ -78,10 +77,10 @@ async function readTextUrl(url: URL): Promise<string | undefined> {
 }
 
 async function mapFilePart(
-  part: LanguageModelV4FilePart,
+  part: LanguageModelV3FilePart,
   messageIndex: number,
   partIndex: number,
-  warnings: SharedV4Warning[],
+  warnings: SharedV3Warning[],
 ): Promise<AcpContentBlock | undefined> {
   const topLevelType = part.mediaType.toLowerCase().split("/")[0];
   if (topLevelType === "image" || topLevelType === "audio") {
@@ -106,57 +105,22 @@ async function mapFilePart(
   let text: string | undefined;
   let uri = fileUri(messageIndex, partIndex, part.filename);
   try {
-    switch (part.data.type) {
-      case "text":
-        text = part.data.text;
-        break;
-      case "data":
-        text =
-          typeof part.data.data === "string"
-            ? Buffer.from(part.data.data, "base64").toString("utf8")
-            : Buffer.from(part.data.data).toString("utf8");
-        break;
-      case "url":
-        text = await readTextUrl(part.data.url);
-        uri = part.data.url.toString();
-        if (text === undefined) {
-          warnings.push(
-            unsupported(
-              "remote file URL",
-              `ACP does not expose verified remote URL fetching for '${part.data.url.toString()}'; the file was omitted.`,
-            ),
-          );
-        }
-        break;
-      case "reference": {
-        const reference = part.data.reference["grok-build"];
-        if (!reference) {
-          warnings.push(
-            unsupported(
-              "file reference",
-              "The file has no grok-build provider reference; it was omitted.",
-            ),
-          );
-          break;
-        }
-        const referenceUrl = reference.startsWith("file:")
-          ? new URL(reference)
-          : isAbsolute(reference)
-            ? pathToFileURL(reference)
-            : undefined;
-        if (!referenceUrl) {
-          warnings.push(
-            unsupported(
-              "file reference",
-              `The grok-build reference '${reference}' is not a local file path; it was omitted.`,
-            ),
-          );
-          break;
-        }
-        uri = referenceUrl.toString();
-        text = await readTextUrl(referenceUrl);
-        break;
+    if (part.data instanceof URL) {
+      text = await readTextUrl(part.data);
+      uri = part.data.toString();
+      if (text === undefined) {
+        warnings.push(
+          unsupported(
+            "remote file URL",
+            `ACP does not expose verified remote URL fetching for '${part.data.toString()}'; the file was omitted.`,
+          ),
+        );
       }
+    } else {
+      text =
+        typeof part.data === "string"
+          ? Buffer.from(part.data, "base64").toString("utf8")
+          : Buffer.from(part.data).toString("utf8");
     }
   } catch (error) {
     warnings.push(
@@ -178,7 +142,7 @@ async function mapFilePart(
 
 function warnProviderOptions(
   value: unknown,
-  warnings: SharedV4Warning[],
+  warnings: SharedV3Warning[],
 ): void {
   if (value && typeof value === "object" && Object.keys(value).length > 0) {
     warnings.push(
@@ -191,11 +155,11 @@ function warnProviderOptions(
 }
 
 export async function mapGrokBuildPrompt(
-  prompt: LanguageModelV4Prompt,
-  responseFormat?: LanguageModelV4CallOptions["responseFormat"],
+  prompt: LanguageModelV3Prompt,
+  responseFormat?: LanguageModelV3CallOptions["responseFormat"],
 ): Promise<MappedGrokBuildPrompt> {
   const blocks: AcpContentBlock[] = [];
-  const warnings: SharedV4Warning[] = [];
+  const warnings: SharedV3Warning[] = [];
   const addText = (text: string): void => {
     if (!text) return;
     const previous = blocks.at(-1);
@@ -232,22 +196,6 @@ export async function mapGrokBuildPrompt(
             compatibility(
               "reasoning history",
               "Private reasoning history cannot be restored through ACP and was omitted.",
-            ),
-          );
-          break;
-        case "reasoning-file":
-          warnings.push(
-            unsupported(
-              "reasoning file history",
-              "ACP has no reasoning-file input channel; the part was omitted.",
-            ),
-          );
-          break;
-        case "custom":
-          warnings.push(
-            unsupported(
-              "custom prompt part",
-              `ACP has no standard input mapping for '${part.kind}'; the part was omitted.`,
             ),
           );
           break;
@@ -308,11 +256,11 @@ export async function mapGrokBuildPrompt(
 }
 
 export function mapGrokBuildCallWarnings(
-  options: LanguageModelV4CallOptions,
-): SharedV4Warning[] {
-  const warnings: SharedV4Warning[] = [];
+  options: LanguageModelV3CallOptions,
+): SharedV3Warning[] {
+  const warnings: SharedV3Warning[] = [];
   const unsupportedSettings: Array<
-    [keyof LanguageModelV4CallOptions, unknown]
+    [keyof LanguageModelV3CallOptions, unknown]
   > = [
     ["maxOutputTokens", options.maxOutputTokens],
     ["temperature", options.temperature],
