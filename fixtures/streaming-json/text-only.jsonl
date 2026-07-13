@@ -1,0 +1,23 @@
+{"type":"thought","data":"The"}
+{"type":"thought","data":" user"}
+{"type":"thought","data":" wants"}
+{"type":"thought","data":" me"}
+{"type":"thought","data":" to"}
+{"type":"thought","data":" reply"}
+{"type":"thought","data":" with"}
+{"type":"thought","data":" exactly"}
+{"type":"thought","data":" \""}
+{"type":"thought","data":"ping"}
+{"type":"thought","data":"\"."}
+{"type":"thought","data":" This"}
+{"type":"thought","data":" is"}
+{"type":"thought","data":" a"}
+{"type":"thought","data":" simple"}
+{"type":"thought","data":" request"}
+{"type":"thought","data":" with"}
+{"type":"thought","data":" no"}
+{"type":"thought","data":" tools"}
+{"type":"thought","data":" needed"}
+{"type":"thought","data":"."}
+{"type":"text","data":"ping"}
+{"type":"end","stopReason":"EndTurn","sessionId":"019f58fb-a9fb-7292-961c-8493eb51a93f","requestId":"8917e98b-0da8-4e58-be6a-95b04177a1b0","usage":{"input_tokens":9521,"cache_read_input_tokens":6016,"output_tokens":29,"reasoning_tokens":24,"total_tokens":15566},"num_turns":1,"modelUsage":{"grok-4.5":{"inputTokens":9521,"outputTokens":29,"cacheReadInputTokens":6016,"modelCalls":1}}}
