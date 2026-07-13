@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-07-13
+
+### Changed
+
+- Adopted per-generation version lines: `1.x` tracks AI SDK v7 (`latest`), `0.2.x` tracks AI SDK v6 (dist-tag `ai-sdk-v6`). Functionally identical to `0.1.1`; the early `0.1.x` and `0.1.x-ai-sdk-v6` versions are deprecated because their prerelease-suffixed scheme broke caret-range updates for the v6 line.
+
 ## [0.1.1] - 2026-07-13
 
 ### Fixed
