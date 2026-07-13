@@ -1,6 +1,6 @@
 {
   "name": "ai-sdk-provider-grok-build",
-  "version": "0.1.1",
+  "version": "1.0.0",
   "description": "AI SDK v7 provider for the xAI Grok Build CLI over ACP",
   "keywords": [
     "ai-sdk",
