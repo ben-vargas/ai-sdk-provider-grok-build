@@ -21,7 +21,7 @@ import { APICallError } from "@ai-sdk/provider";
 import { parseProviderOptions } from "@ai-sdk/provider-utils";
 import { abortError } from "./abort.js";
 import { NdjsonFramer } from "./acp/client.js";
-import { AcpProtocolError, stderrTail } from "./acp/errors.js";
+import { AcpProtocolError } from "./acp/errors.js";
 import type { JsonValue } from "./acp/protocol.js";
 import { GrokCliError, mapGrokExecError } from "./errors.js";
 import { ensureGrokCliVersion, resolveGrokCommand } from "./grok-cli.js";
@@ -570,9 +570,7 @@ export class GrokExecLanguageModel implements LanguageModelV4 {
                   {
                     code: "GROK_CLI_PROCESS_EXIT",
                     exitCode: code,
-                    stderr: String(
-                      redactSensitiveData(stderrTail(stderr)) ?? "",
-                    ),
+                    stderr,
                   },
                 );
               }

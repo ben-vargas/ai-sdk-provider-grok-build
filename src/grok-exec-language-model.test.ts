@@ -726,4 +726,24 @@ describe("GrokExecLanguageModel", () => {
       data: expect.objectContaining({ code: "GROK_CLI_PROCESS_EXIT" }),
     });
   });
+
+  it("classifies authentication from raw process stderr before redaction", async () => {
+    const { model } = fixtureModel((child) => {
+      child.stderr.write(
+        "Authorization: Bearer headless-secret\nError: authentication required\n",
+      );
+      child.finish(7);
+    });
+
+    const promise = model.doGenerate(callOptions());
+    await expect(promise).rejects.toBeInstanceOf(LoadAPIKeyError);
+    await expect(promise).rejects.not.toMatchObject({
+      message: expect.stringContaining("headless-secret"),
+    });
+    await expect(promise).rejects.toMatchObject({
+      cause: {
+        stderr: expect.not.stringContaining("headless-secret"),
+      },
+    });
+  });
 });

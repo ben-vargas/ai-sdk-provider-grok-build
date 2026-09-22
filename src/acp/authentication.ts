@@ -1,12 +1,22 @@
 export const ACP_AUTHENTICATION_REQUIRED_CODE = -32000;
 export const JSON_RPC_INTERNAL_ERROR_CODE = -32603;
 
-export function grokAuthenticationRemediation(
-  authMethod: string,
-  code?: string,
-): string {
+export interface GrokAuthenticationRemediationContext {
+  authMethod: string;
+  code?: string;
+  availableMethods?: readonly string[];
+}
+
+export function grokAuthenticationRemediation({
+  authMethod,
+  code,
+  availableMethods,
+}: GrokAuthenticationRemediationContext): string {
   if (code === "AUTH_METHOD_NOT_AVAILABLE") {
-    return "Set the provider 'authMethod' to one of the ACP methods listed above. Alternatively, use the provider-only API-key mode by setting the provider 'apiKey' option, or set 'authMethod' to 'api_key' together with a valid XAI_API_KEY; 'api_key' is not an ACP-advertised method.";
+    if (availableMethods?.length === 0) {
+      return "Grok advertised no ACP authentication methods. Use the provider-only API-key mode by setting the provider 'apiKey' option, or set 'authMethod' to 'api_key' together with a valid XAI_API_KEY; 'api_key' is not an ACP-advertised method.";
+    }
+    return "Set the provider 'authMethod' to one of the ACP methods reported in the diagnostic above. Alternatively, use the provider-only API-key mode by setting the provider 'apiKey' option, or set 'authMethod' to 'api_key' together with a valid XAI_API_KEY; 'api_key' is not an ACP-advertised method.";
   }
   if (authMethod === "api_key") {
     return "Verify or replace the provider 'apiKey' value. When supplying the key through the environment, set 'authMethod' to 'api_key' together with a valid XAI_API_KEY.";
@@ -35,12 +45,14 @@ const LEGACY_AUTHENTICATION_RPC_DIAGNOSTICS = [
 
 export function isLegacyGrokAuthenticationRpcFailure(
   method: string,
-  rpcMessage: string,
+  rpcDiagnostics: readonly string[],
 ): boolean {
   return (
     LEGACY_AUTHENTICATION_RPC_METHODS.has(method) &&
-    LEGACY_AUTHENTICATION_RPC_DIAGNOSTICS.some((diagnostic) =>
-      diagnostic.test(rpcMessage),
+    rpcDiagnostics.some((message) =>
+      LEGACY_AUTHENTICATION_RPC_DIAGNOSTICS.some((diagnostic) =>
+        diagnostic.test(message),
+      ),
     )
   );
 }

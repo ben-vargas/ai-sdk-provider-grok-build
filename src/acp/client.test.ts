@@ -1277,9 +1277,15 @@ describe("AcpClient fixture replay", () => {
       error: { code: -32000, message: "Authentication required" },
     });
     await new Promise((resolve) => setImmediate(resolve));
-    controller.abort();
+    const originalCause = new Error("original abort cause");
+    const abortReason = new Error("caller cancelled authentication", {
+      cause: originalCause,
+    });
+    controller.abort(abortReason);
 
-    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    const error = await pending.catch((value: unknown) => value);
+    expect(error).toBe(abortReason);
+    expect(abortReason.cause).toBe(originalCause);
     expect(
       child.requests.filter(
         (request) => "method" in request && request.method === "session/new",
@@ -1375,15 +1381,23 @@ describe("AcpClient failures", () => {
     const client = new AcpClient({ authMethod: false, spawn: () => child });
     const pending = client.initialize();
     await new Promise((resolve) => setImmediate(resolve));
-    child.sendRaw('{"jsonrpc":"2.0",not-json}\n');
+    child.stderr.write("initialization parser detail\n");
+    child.sendRaw(
+      '{"jsonrpc":"2.0",not-json,"authorization":"Bearer\tsk-malformed-secret"}\n',
+    );
 
-    await expect(pending).rejects.toMatchObject({
+    const error = await pending.catch((value: unknown) => value);
+    expect(error).toMatchObject({
       name: "AcpProtocolError",
       code: "PROTOCOL_ERROR",
+      stderr: "initialization parser detail\n",
     });
+    expect(error).toBe(client.failure);
+    expect((error as Error).message).not.toContain("sk-malformed-secret");
     expect(client.failure?.message).toContain(
       "Invalid JSON from Grok ACP stdout",
     );
+    expect(client.failure?.message).not.toContain("sk-malformed-secret");
     expect(child.killSignals).toContain("SIGTERM");
   });
 
@@ -1421,13 +1435,14 @@ describe("AcpClient failures", () => {
     child.stdout.end();
     child.stderr.end("complete crash output\n");
 
-    await expect(pending).rejects.toMatchObject({
+    const error = await pending.catch((value: unknown) => value);
+    expect(error).toMatchObject({
       name: "AcpProcessExitError",
       code: "PROCESS_EXIT",
       exitCode: 9,
       stderr: "complete crash output\n",
     });
-    expect(client.failure).toMatchObject({ code: "PROCESS_EXIT" });
+    expect(error).toBe(client.failure);
   });
 
   it("keeps terminal stdin diagnosis independent from terminate grace", async () => {
@@ -1769,6 +1784,11 @@ describe("AcpClient failures", () => {
           method: "session/new",
           rpcCode: -32000,
         }),
+        expect.objectContaining({
+          name: "AcpTimeoutError",
+          method: "authenticate",
+          code: "TIMEOUT",
+        }),
       ]);
       await client.dispose();
     } finally {
@@ -1817,15 +1837,79 @@ describe("AcpClient failures", () => {
           rpcCode: -32000,
         }),
         expect.objectContaining({
-          name: "AcpJsonRpcError",
-          method: "authenticate",
-          rpcCode: -32000,
+          name: "AcpAuthenticationError",
+          code: "AUTHENTICATION_FAILED",
+          cause: expect.objectContaining({
+            name: "AcpJsonRpcError",
+            method: "authenticate",
+            rpcCode: -32000,
+          }),
         }),
       ]);
     } finally {
       await client.dispose();
     }
   });
+
+  it.each(["session/new", "session/load"] as const)(
+    "keeps the initial auth failure when the retried %s request also fails",
+    async (method) => {
+      const child = new FixtureChild(readFixture("text-only.jsonl"), [method]);
+      const client = new AcpClient({ spawn: () => child });
+      const requestsForMethod = (): JsonRpcRequest[] =>
+        child.requests.filter(
+          (request): request is JsonRpcRequest =>
+            "method" in request && "id" in request && request.method === method,
+        );
+      try {
+        const pending =
+          method === "session/new"
+            ? client.newSession({ cwd: "/fixture", mcpServers: [] })
+            : client.loadSession({
+                sessionId: "existing-session",
+                cwd: "/fixture",
+                mcpServers: [],
+              });
+        void pending.catch(() => undefined);
+        await vi.waitFor(() => expect(requestsForMethod()).toHaveLength(1));
+        child.send({
+          jsonrpc: "2.0",
+          id: requestsForMethod()[0]?.id,
+          error: { code: -32000, message: "Authentication required" },
+        });
+        await vi.waitFor(() => expect(requestsForMethod()).toHaveLength(2));
+        child.send({
+          jsonrpc: "2.0",
+          id: requestsForMethod()[1]?.id,
+          error: { code: -32603, message: "Session service unavailable" },
+        });
+
+        const error = await pending.catch((value: unknown) => value);
+        expect(error).toMatchObject({
+          name: "AcpJsonRpcError",
+          method,
+          rpcCode: -32603,
+          cause: expect.any(AggregateError),
+        });
+        const aggregate = (error as Error).cause as AggregateError;
+        expect(aggregate.errors).toEqual([
+          expect.objectContaining({
+            name: "AcpJsonRpcError",
+            method,
+            rpcCode: -32000,
+          }),
+          expect.objectContaining({
+            name: "AcpJsonRpcError",
+            method,
+            rpcCode: -32603,
+          }),
+        ]);
+        expect(error).not.toBe(aggregate.errors[1]);
+      } finally {
+        await client.dispose();
+      }
+    },
+  );
 
   it("explains how to recover when an authentication method is unavailable", async () => {
     const child = new FixtureChild(readFixture("text-only.jsonl"));
@@ -1866,10 +1950,15 @@ describe("AcpClient failures", () => {
     child.send({
       jsonrpc: "2.0",
       id: request.id,
-      error: { code: -32000, message: "Authentication required" },
+      error: {
+        code: -32000,
+        message:
+          "Authorization: Bearer sk-authenticate-secret\nError: Authentication required",
+      },
     });
 
-    await expect(pending).rejects.toMatchObject({
+    const error = await pending.catch((value: unknown) => value);
+    expect(error).toMatchObject({
       name: "AcpAuthenticationError",
       code: "AUTHENTICATION_FAILED",
       cause: {
@@ -1878,6 +1967,11 @@ describe("AcpClient failures", () => {
         method: "authenticate",
       },
     });
+    expect(error).toBeInstanceOf(Error);
+    if (error instanceof Error) {
+      expect(error.message).toContain("Authentication required");
+      expect(error.message).not.toContain("sk-authenticate-secret");
+    }
     await client.dispose();
   });
 
@@ -1940,9 +2034,11 @@ describe("AcpClient failures", () => {
     const child = new FixtureChild(readFixture("text-only.jsonl"), [
       "session/new",
       "authenticate",
+      "session/load",
     ]);
     const client = new AcpClient({ spawn: () => child });
     const pending = client.newSession({ cwd: "/fixture", mcpServers: [] });
+    const observed = pending.catch((value: unknown) => value);
     await new Promise((resolve) => setImmediate(resolve));
     const sessionRequest = child.requests.find(
       (message) => "method" in message && message.method === "session/new",
@@ -1953,15 +2049,32 @@ describe("AcpClient failures", () => {
       error: { code: -32000, message: "Authentication required" },
     });
     await new Promise((resolve) => setImmediate(resolve));
+    const unrelated = client
+      .request("session/load", {
+        sessionId: "unrelated-session",
+        cwd: "/fixture",
+        mcpServers: [],
+      })
+      .catch((value: unknown) => value);
+    await new Promise((resolve) => setImmediate(resolve));
     child.failWithStderr("authentication worker crashed\n", 17);
 
-    await expect(pending).rejects.toMatchObject({
+    const [error, unrelatedError] = await Promise.all([observed, unrelated]);
+    expect(error).toMatchObject({
       name: "AcpProcessExitError",
       code: "PROCESS_EXIT",
       exitCode: 17,
       cause: expect.any(AggregateError),
     });
-    expect(client.failure?.name).not.toBe("AcpAuthenticationError");
+    expect(error).not.toBe(client.failure);
+    expect(unrelatedError).toBe(client.failure);
+    expect(client.failure).toMatchObject({
+      name: "AcpProcessExitError",
+      code: "PROCESS_EXIT",
+      cause: undefined,
+    });
+    const aggregate = (error as Error).cause as AggregateError;
+    expect(aggregate.errors[1]).toBe(client.failure);
   });
 
   it("does not turn disposal during authentication retry into a login error", async () => {
@@ -2140,6 +2253,102 @@ describe("AcpClient failures", () => {
     await expect(healthy).resolves.toMatchObject({
       sessionId: "healthy-session",
     });
+    await client.dispose();
+  });
+
+  it.each([
+    ["missing message", { code: -32603 }],
+    ["non-string message", { code: -32603, message: 17 }],
+    ["null error", null],
+    ["missing code", { message: "failure" }],
+  ])(
+    "keeps a malformed JSON-RPC error with %s local to its request",
+    async (_label, malformedError) => {
+      const child = new FixtureChild(readFixture("text-only.jsonl"), [
+        "session/new",
+        "session/load",
+      ]);
+      const client = new AcpClient({ authMethod: false, spawn: () => child });
+      try {
+        const malformed = client.newSession({
+          cwd: "/fixture",
+          mcpServers: [],
+        });
+        const healthy = client.request("session/load", {
+          sessionId: "healthy-session",
+          cwd: "/fixture",
+          mcpServers: [],
+        });
+        void malformed.catch(() => undefined);
+        await vi.waitFor(() =>
+          expect(
+            child.requests.filter(
+              (message) => "method" in message && "id" in message,
+            ),
+          ).toHaveLength(3),
+        );
+        const sessionRequest = child.requests.find(
+          (message) => "method" in message && message.method === "session/new",
+        ) as JsonRpcRequest;
+        const loadRequest = child.requests.find(
+          (message) => "method" in message && message.method === "session/load",
+        ) as JsonRpcRequest;
+        child.send({
+          jsonrpc: "2.0",
+          id: sessionRequest.id,
+          error: malformedError,
+        });
+        child.send({ jsonrpc: "2.0", id: loadRequest.id, result: null });
+
+        await expect(malformed).rejects.toMatchObject({
+          name: "AcpProtocolError",
+          code: "PROTOCOL_ERROR",
+        });
+        await expect(healthy).resolves.toBeNull();
+        expect(client.failure).toBeUndefined();
+        expect(client.isUsable).toBe(true);
+      } finally {
+        await client.dispose();
+      }
+    },
+  );
+
+  it("retires malformed initialization while attaching only sanitized initialization stderr", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "initialize",
+    ]);
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    const pending = client.initialize();
+    void pending.catch(() => undefined);
+    await vi.waitFor(() => expect(child.requests).toHaveLength(1));
+    const request = child.requests[0] as JsonRpcRequest;
+    child.stderr.write(
+      "initialize detail Authorization: Bearer sk-initialize-secret\n",
+    );
+    child.send({
+      jsonrpc: "2.0",
+      id: request.id,
+      error: { code: -32603 },
+    });
+
+    const error = await pending.catch((value: unknown) => value);
+    expect(error).toBe(client.failure);
+    expect(error).toMatchObject({
+      name: "AcpProtocolError",
+      code: "PROTOCOL_ERROR",
+      stderr: "initialize detail Authorization: Bearer [REDACTED]\n",
+    });
+    expect((error as Error).message).not.toContain("sk-initialize-secret");
+    expect((error as Error).cause).toMatchObject({
+      name: "AcpProtocolError",
+      code: "PROTOCOL_ERROR",
+      stderr: undefined,
+    });
+    expect((error as Error).cause).not.toBe(error);
+    expect(((error as Error).cause as Error).stack).toContain(
+      "AcpProtocolError",
+    );
+    expect(client.isUsable).toBe(false);
     await client.dispose();
   });
 

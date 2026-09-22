@@ -1,5 +1,8 @@
 import type { JsonRpcErrorObject, JsonValue } from "./protocol.js";
-import { redactSensitiveData } from "../redact.js";
+import {
+  redactSensitiveDiagnosticData,
+  visitRedactedSensitiveTextLines,
+} from "../redact.js";
 import {
   ACP_AUTHENTICATION_REQUIRED_CODE,
   JSON_RPC_INTERNAL_ERROR_CODE,
@@ -25,28 +28,125 @@ export function stripAnsiEscapeSequences(raw: string): string {
 
 const MAX_PUBLIC_DIAGNOSTIC_CODE_POINTS = 600;
 const MAX_PUBLIC_DIAGNOSTIC_LINES = 5;
+const MAX_AUTHENTICATION_DIAGNOSTIC_LINES = 32;
+const MAX_DIAGNOSTIC_LINE_WORK_CODE_POINTS =
+  MAX_PUBLIC_DIAGNOSTIC_CODE_POINTS * 2;
+const SANITIZED_STDERR = Symbol("sanitized-stderr");
+const SANITIZED_MESSAGE = Symbol("sanitized-message");
+const SANITIZED_DIAGNOSTIC_DATA = Symbol("sanitized-diagnostic-data");
+const SANITIZED_RPC_DIAGNOSTICS = Symbol("sanitized-rpc-diagnostics");
+const LEGACY_AUTHENTICATION_FAILURE = Symbol("legacy-authentication-failure");
 
-function sanitizedDiagnosticLines(raw: string): string[] {
-  const normalized = stripAnsiEscapeSequences(raw)
-    .split(/\r\n|\r|\n|\u2028|\u2029/)
-    .map((line) =>
-      Array.from(line)
-        .filter((character) => {
-          const codePoint = character.codePointAt(0) ?? 0;
-          return (
-            codePoint >= 0x20 &&
-            codePoint !== 0x7f &&
-            (codePoint < 0x80 || codePoint > 0x9f)
-          );
-        })
-        .join("")
-        .trim(),
-    );
-  const redacted = redactSensitiveData(normalized.join("\n"));
-  return (typeof redacted === "string" ? redacted : "")
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
+const sanitizedDiagnosticErrors = new WeakSet<Error>();
+const sanitizedStderrByError = new WeakMap<Error, SanitizedStderrDetails>();
+const legacyAuthenticationFailures = new WeakSet<AcpJsonRpcError>();
+
+interface SanitizedStderrDetails {
+  multiline: string;
+  inline: string;
+}
+
+interface NormalizedDiagnosticLine {
+  value: string;
+}
+
+type InternalAcpErrorOptions = AcpErrorOptions & {
+  [SANITIZED_DIAGNOSTIC_DATA]?: JsonValue;
+  [SANITIZED_MESSAGE]?: string;
+  [SANITIZED_RPC_DIAGNOSTICS]?: readonly string[];
+  [SANITIZED_STDERR]?: SanitizedStderrDetails;
+  [LEGACY_AUTHENTICATION_FAILURE]?: boolean;
+};
+
+function normalizeDiagnosticLine(
+  line: string,
+  selection: "start" | "end",
+): NormalizedDiagnosticLine {
+  const maxCodeUnits = MAX_DIAGNOSTIC_LINE_WORK_CODE_POINTS * 2;
+  const window =
+    line.length <= maxCodeUnits
+      ? line
+      : selection === "start"
+        ? line.slice(0, maxCodeUnits)
+        : line.slice(-maxCodeUnits);
+  const codePoints = Array.from(window);
+  const truncated =
+    window.length !== line.length ||
+    codePoints.length > MAX_DIAGNOSTIC_LINE_WORK_CODE_POINTS;
+  let bounded = truncated
+    ? selection === "start"
+      ? codePoints.slice(0, MAX_DIAGNOSTIC_LINE_WORK_CODE_POINTS - 1).join("")
+      : codePoints.slice(-(MAX_DIAGNOSTIC_LINE_WORK_CODE_POINTS - 1)).join("")
+    : window;
+  bounded = bounded
+    .replace(
+      // eslint-disable-next-line no-control-regex
+      /[\u0000-\u001f\u007f-\u009f]/g,
+      " ",
+    )
+    .trim();
+  if (truncated && selection === "end") {
+    bounded = `…${bounded}`;
+  } else if (truncated) {
+    bounded = `${bounded}…`;
+  }
+  return { value: bounded };
+}
+
+export function sanitizeDiagnosticLines(
+  raw: string,
+  selection: "start" | "end" = "start",
+): string[] {
+  const selected: string[] = [];
+  visitRedactedSensitiveTextLines(
+    raw,
+    { diagnosticContext: true },
+    (line) => {
+      const value = normalizeDiagnosticLine(
+        stripAnsiEscapeSequences(line),
+        selection,
+      ).value;
+      if (!value) return true;
+      if (selection === "start") {
+        selected.push(value);
+        return selected.length < MAX_PUBLIC_DIAGNOSTIC_LINES;
+      }
+      selected.push(value);
+      if (selected.length > MAX_PUBLIC_DIAGNOSTIC_LINES) selected.shift();
+      return true;
+    },
+    {
+      maxCodeUnits: MAX_DIAGNOSTIC_LINE_WORK_CODE_POINTS * 2,
+      selection,
+    },
+  );
+  return selected;
+}
+
+function visitDiagnosticLines(
+  raw: string,
+  visitor: (line: string) => boolean,
+): void {
+  const lineBreak = /\r\n|\r|\n|\u2028|\u2029/g;
+  let start = 0;
+  for (let match = lineBreak.exec(raw); match; match = lineBreak.exec(raw)) {
+    if (!visitor(raw.slice(start, match.index))) return;
+    start = match.index + match[0].length;
+  }
+  visitor(raw.slice(start));
+}
+
+function authenticationDiagnosticLines(raw: string): string[] {
+  const selected: string[] = [];
+  visitDiagnosticLines(raw, (line) => {
+    const value = normalizeDiagnosticLine(
+      stripAnsiEscapeSequences(line),
+      "start",
+    ).value;
+    if (value) selected.push(value);
+    return selected.length < MAX_AUTHENTICATION_DIAGNOSTIC_LINES;
+  });
+  return selected;
 }
 
 function limitDiagnosticStart(raw: string): string {
@@ -58,35 +158,51 @@ function limitDiagnosticStart(raw: string): string {
 
 /** Sanitizes an agent-provided diagnostic while retaining its leading context. */
 export function sanitizeDiagnosticMessage(raw: string): string {
-  return limitDiagnosticStart(
-    sanitizedDiagnosticLines(raw)
-      .slice(0, MAX_PUBLIC_DIAGNOSTIC_LINES)
-      .join("; "),
-  );
+  return limitDiagnosticStart(sanitizeDiagnosticLines(raw, "start").join("; "));
 }
 
-function sanitizeStderr(raw: string): string {
-  const hasTrailingLineBreak = /(?:\r\n|\r|\n|\u2028|\u2029)$/.test(raw);
-  const lines = sanitizedDiagnosticLines(raw).slice(
-    -MAX_PUBLIC_DIAGNOSTIC_LINES,
-  );
-  const value = `${lines.join("\n")}${
-    hasTrailingLineBreak && lines.length > 0 ? "\n" : ""
-  }`;
-  const codePoints = Array.from(value);
+function limitDiagnosticEnd(raw: string): string {
+  const codePoints = Array.from(raw);
   return codePoints.length > MAX_PUBLIC_DIAGNOSTIC_CODE_POINTS
     ? `…${codePoints.slice(-(MAX_PUBLIC_DIAGNOSTIC_CODE_POINTS - 1)).join("")}`
-    : value;
+    : raw;
+}
+
+export function sanitizeStderrDetails(raw: string): SanitizedStderrDetails {
+  const hasTrailingLineBreak = /(?:\r\n|\r|\n|\u2028|\u2029)$/.test(raw);
+  const lines = sanitizeDiagnosticLines(raw, "end");
+  const multiline = `${lines.join("\n")}${
+    hasTrailingLineBreak && lines.length > 0 ? "\n" : ""
+  }`;
+  return {
+    multiline: limitDiagnosticEnd(multiline),
+    inline: limitDiagnosticEnd(lines.join("; ")),
+  };
 }
 
 export function stderrTail(raw: string): string {
-  const lines = sanitizedDiagnosticLines(raw)
-    .slice(-MAX_PUBLIC_DIAGNOSTIC_LINES)
-    .join("; ");
-  const codePoints = Array.from(lines);
-  return codePoints.length > MAX_PUBLIC_DIAGNOSTIC_CODE_POINTS
-    ? `…${codePoints.slice(-(MAX_PUBLIC_DIAGNOSTIC_CODE_POINTS - 1)).join("")}`
-    : lines;
+  return sanitizeStderrDetails(raw).inline;
+}
+
+/** @internal Reuses a message that has already crossed the diagnostic sanitizer. */
+export function markAcpErrorMessageSanitized<T extends AcpErrorOptions>(
+  message: string,
+  options: T,
+): T {
+  return {
+    ...options,
+    [SANITIZED_MESSAGE]: message,
+  } as T;
+}
+
+/** @internal Indicates whether an ACP error message is already sanitized. */
+export function isSanitizedAcpDiagnosticError(error: Error): boolean {
+  return sanitizedDiagnosticErrors.has(error);
+}
+
+/** @internal Returns the stored inline form without sanitizing stderr again. */
+export function stderrTailForAcpError(error: AcpError): string {
+  return sanitizedStderrByError.get(error)?.inline ?? "";
 }
 
 export class AcpError extends Error {
@@ -97,26 +213,48 @@ export class AcpError extends Error {
   readonly data?: JsonValue;
 
   constructor(message: string, options: AcpErrorOptions = {}) {
-    super(message, { cause: options.cause });
+    const internalOptions = options as InternalAcpErrorOptions;
+    super(
+      internalOptions[SANITIZED_MESSAGE] ?? sanitizeDiagnosticMessage(message),
+      {
+        cause: options.cause,
+      },
+    );
+    sanitizedDiagnosticErrors.add(this);
     this.name = "AcpError";
     this.code = options.code;
-    const sanitizedStderr = options.stderr
-      ? sanitizeStderr(options.stderr)
-      : "";
-    this.stderr = sanitizedStderr || undefined;
+    const sanitizedStderr =
+      internalOptions[SANITIZED_STDERR] ??
+      (options.stderr ? sanitizeStderrDetails(options.stderr) : undefined);
+    this.stderr = sanitizedStderr?.multiline || undefined;
+    if (sanitizedStderr) sanitizedStderrByError.set(this, sanitizedStderr);
     this.exitCode = options.exitCode;
     this.signal = options.signal;
-    this.data = options.data;
+    this.data = Object.hasOwn(internalOptions, SANITIZED_DIAGNOSTIC_DATA)
+      ? internalOptions[SANITIZED_DIAGNOSTIC_DATA]
+      : redactSensitiveDiagnosticData(options.data);
   }
 }
 
+export interface AcpAuthenticationErrorOptions extends AcpErrorOptions {
+  authenticationMethod?: string;
+  availableAuthenticationMethods?: readonly string[];
+}
+
 export class AcpAuthenticationError extends AcpError {
-  constructor(message: string, options: AcpErrorOptions = {}) {
-    super(sanitizeDiagnosticMessage(message), {
+  readonly authenticationMethod?: string;
+  readonly availableAuthenticationMethods?: readonly string[];
+
+  constructor(message: string, options: AcpAuthenticationErrorOptions = {}) {
+    super(message, {
       ...options,
       code: options.code ?? "AUTHENTICATION_FAILED",
     });
     this.name = "AcpAuthenticationError";
+    this.authenticationMethod = options.authenticationMethod;
+    this.availableAuthenticationMethods = options.availableAuthenticationMethods
+      ? [...options.availableAuthenticationMethods]
+      : undefined;
   }
 }
 
@@ -137,6 +275,7 @@ export class AcpProtocolError extends AcpError {
 export class AcpJsonRpcError extends AcpProtocolError {
   readonly rpcCode: number;
   readonly rpcMessage: string;
+  readonly rpcDiagnostics: readonly string[];
   readonly method: string;
 
   constructor(
@@ -144,15 +283,29 @@ export class AcpJsonRpcError extends AcpProtocolError {
     error: JsonRpcErrorObject,
     options: AcpErrorOptions = {},
   ) {
-    const rpcMessage = sanitizeDiagnosticMessage(error.message);
-    super(`ACP request '${method}' failed (${error.code}): ${rpcMessage}`, {
+    const internalOptions = options as InternalAcpErrorOptions;
+    const rpcDiagnostics =
+      internalOptions[SANITIZED_RPC_DIAGNOSTICS] ??
+      sanitizeDiagnosticLines(error.message, "start");
+    const rpcMessage = limitDiagnosticStart(rpcDiagnostics.join("; "));
+    const message = `ACP request '${method}' failed (${error.code}): ${rpcMessage}`;
+    const legacyAuthenticationFailure =
+      internalOptions[LEGACY_AUTHENTICATION_FAILURE] ??
+      isLegacyGrokAuthenticationRpcFailure(
+        method,
+        authenticationDiagnosticLines(error.message),
+      );
+    super(message, {
       ...options,
+      [SANITIZED_MESSAGE]: message,
       code: "JSON_RPC_ERROR",
-      data: redactSensitiveData(error.data),
-    });
+      data: error.data,
+    } as InternalAcpErrorOptions);
     this.name = "AcpJsonRpcError";
+    if (legacyAuthenticationFailure) legacyAuthenticationFailures.add(this);
     this.rpcCode = error.code;
     this.rpcMessage = rpcMessage;
+    this.rpcDiagnostics = rpcDiagnostics;
     this.method = method;
   }
 }
@@ -165,7 +318,7 @@ export function isAcpAuthenticationRpcError(
     error instanceof AcpJsonRpcError &&
     (error.rpcCode === ACP_AUTHENTICATION_REQUIRED_CODE ||
       (error.rpcCode === JSON_RPC_INTERNAL_ERROR_CODE &&
-        isLegacyGrokAuthenticationRpcFailure(error.method, error.rpcMessage)))
+        legacyAuthenticationFailures.has(error)))
   );
 }
 
@@ -197,17 +350,21 @@ export class AcpProcessExitError extends AcpError {
     const status = signal
       ? `signal ${signal}`
       : `exit code ${String(exitCode)}`;
-    const tail = options.stderr ? stderrTail(options.stderr) : "";
+    const internalOptions = options as InternalAcpErrorOptions;
+    const sanitizedStderr =
+      internalOptions[SANITIZED_STDERR] ??
+      (options.stderr ? sanitizeStderrDetails(options.stderr) : undefined);
+    const tail = sanitizedStderr?.inline ?? "";
     const stderrSuffix = tail ? ` Stderr tail: ${tail}` : "";
-    super(
-      `Grok ACP process exited unexpectedly with ${status}.${stderrSuffix}`,
-      {
-        ...options,
-        code: "PROCESS_EXIT",
-        exitCode,
-        signal,
-      },
-    );
+    const message = `Grok ACP process exited unexpectedly with ${status}.${stderrSuffix}`;
+    super(message, {
+      ...options,
+      [SANITIZED_MESSAGE]: message,
+      [SANITIZED_STDERR]: sanitizedStderr,
+      code: "PROCESS_EXIT",
+      exitCode,
+      signal,
+    } as InternalAcpErrorOptions);
     this.name = "AcpProcessExitError";
   }
 }
@@ -227,4 +384,66 @@ export function isAcpAuthenticationError(
 
 export function isAcpTimeoutError(error: unknown): error is AcpTimeoutError {
   return error instanceof AcpTimeoutError;
+}
+
+export interface AcpErrorContext {
+  cause?: unknown;
+  stderr?: string;
+}
+
+/** Creates a fresh error with additional context while preserving its ACP type. */
+export function cloneAcpErrorWithContext(
+  error: AcpError,
+  context: AcpErrorContext,
+): AcpError {
+  const options: InternalAcpErrorOptions = {
+    cause: Object.hasOwn(context, "cause") ? context.cause : error.cause,
+    stderr: context.stderr ?? error.stderr,
+    code: error.code,
+    exitCode: error.exitCode,
+    signal: error.signal,
+    data: error.data,
+    [SANITIZED_DIAGNOSTIC_DATA]: error.data,
+    [SANITIZED_MESSAGE]: error.message,
+  };
+  const existingStderr = sanitizedStderrByError.get(error);
+  if (context.stderr === undefined && existingStderr) {
+    options[SANITIZED_STDERR] = existingStderr;
+  }
+  if (error instanceof AcpJsonRpcError) {
+    options[LEGACY_AUTHENTICATION_FAILURE] =
+      legacyAuthenticationFailures.has(error);
+    options[SANITIZED_RPC_DIAGNOSTICS] = error.rpcDiagnostics;
+    return new AcpJsonRpcError(
+      error.method,
+      {
+        code: error.rpcCode,
+        message: error.rpcDiagnostics.join("\n"),
+        data: error.data,
+      },
+      options,
+    );
+  }
+  if (error instanceof AcpAuthenticationError) {
+    return new AcpAuthenticationError(error.message, {
+      ...options,
+      authenticationMethod: error.authenticationMethod,
+      availableAuthenticationMethods: error.availableAuthenticationMethods,
+    });
+  }
+  if (error instanceof AcpTimeoutError)
+    return new AcpTimeoutError(error.method, error.timeoutMs, options);
+  if (error instanceof AcpProcessExitError)
+    return new AcpProcessExitError(
+      error.exitCode ?? null,
+      error.signal ?? null,
+      options,
+    );
+  if (error instanceof AcpSpawnError)
+    return new AcpSpawnError(error.message, options);
+  if (error instanceof AcpPermissionError)
+    return new AcpPermissionError(error.message, options);
+  if (error instanceof AcpProtocolError)
+    return new AcpProtocolError(error.message, options);
+  return new AcpError(error.message, options);
 }

@@ -1,4 +1,3 @@
-import { redactSensitiveData } from "../redact.js";
 import { isRecord } from "../type-guards.js";
 import { AcpProtocolError } from "./errors.js";
 import type {
@@ -22,11 +21,12 @@ import type {
   AcpSessionResult,
   AcpSessionState,
   AcpSetConfigOptionResult,
+  JsonValue,
 } from "./protocol.js";
 
 function malformed(source: string, value: unknown): never {
   throw new AcpProtocolError(`Grok returned malformed ${source}.`, {
-    data: redactSensitiveData(value),
+    data: value as JsonValue,
   });
 }
 

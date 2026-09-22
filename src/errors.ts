@@ -11,8 +11,10 @@ import {
   AcpSpawnError,
   AcpTimeoutError,
   isAcpAuthenticationRpcError,
+  isSanitizedAcpDiagnosticError,
   sanitizeDiagnosticMessage,
-  stderrTail,
+  sanitizeStderrDetails,
+  stderrTailForAcpError,
   stripAnsiEscapeSequences,
 } from "./acp/errors.js";
 
@@ -24,6 +26,8 @@ export interface GrokBuildErrorData {
   rpcCode?: number;
   method?: string;
 }
+
+const grokCliAuthenticationFailures = new WeakSet<GrokCliError>();
 
 export class GrokCliError extends Error {
   readonly code: string;
@@ -39,16 +43,18 @@ export class GrokCliError extends Error {
       stderr?: string;
     },
   ) {
-    super(
-      options.code === "GROK_CLI_HEADLESS_ERROR"
-        ? sanitizeDiagnosticMessage(message)
-        : message,
-      { cause: options.cause },
+    const authenticationFailure = containsAuthenticationFailureDiagnostic(
+      message,
+      options.stderr ?? "",
     );
+    super(sanitizeDiagnosticMessage(message), { cause: options.cause });
+    if (authenticationFailure) grokCliAuthenticationFailures.add(this);
     this.name = "GrokCliError";
     this.code = options.code;
     this.exitCode = options.exitCode;
-    const sanitizedStderr = options.stderr ? stderrTail(options.stderr) : "";
+    const sanitizedStderr = options.stderr
+      ? sanitizeStderrDetails(options.stderr).inline
+      : "";
     this.stderr = sanitizedStderr || undefined;
   }
 }
@@ -70,29 +76,49 @@ export function createGrokBuildAuthenticationError(
 }
 
 function collectAuthenticationDiagnostics(error: Error): string[] {
+  const MAX_AUTHENTICATION_DIAGNOSTICS = 4;
+  const MAX_AUTHENTICATION_ERRORS_INSPECTED = 16;
   const diagnostics: string[] = [];
   const pending: unknown[] = [error];
   const seen = new Set<unknown>();
-  while (pending.length > 0 && diagnostics.length < 4) {
+  let inspected = 0;
+  while (
+    pending.length > 0 &&
+    inspected < MAX_AUTHENTICATION_ERRORS_INSPECTED
+  ) {
     const current = pending.shift();
     if (!(current instanceof Error) || seen.has(current)) continue;
     seen.add(current);
+    inspected++;
     if (current instanceof AggregateError) {
       pending.unshift(...current.errors);
       if (current.cause !== undefined) pending.push(current.cause);
       continue;
     }
-    const diagnostic = sanitizeDiagnosticMessage(current.message);
-    if (
-      diagnostic &&
-      !diagnostics.some(
-        (existing) =>
-          existing === diagnostic ||
-          existing.includes(diagnostic) ||
-          diagnostic.includes(existing),
-      )
-    ) {
-      diagnostics.push(diagnostic);
+    const diagnostic =
+      current instanceof GrokCliError || isSanitizedAcpDiagnosticError(current)
+        ? current.message
+        : sanitizeDiagnosticMessage(current.message);
+    if (diagnostic) {
+      const covered = diagnostics.some(
+        (existing) => existing === diagnostic || existing.includes(diagnostic),
+      );
+      if (!covered) {
+        const containedIndexes = diagnostics
+          .map((existing, index) =>
+            diagnostic.includes(existing) ? index : -1,
+          )
+          .filter((index) => index >= 0);
+        if (containedIndexes.length > 0) {
+          const insertionIndex = containedIndexes[0] ?? diagnostics.length;
+          for (const index of containedIndexes.reverse()) {
+            diagnostics.splice(index, 1);
+          }
+          diagnostics.splice(insertionIndex, 0, diagnostic);
+        } else if (diagnostics.length < MAX_AUTHENTICATION_DIAGNOSTICS) {
+          diagnostics.push(diagnostic);
+        }
+      }
     }
     if (current.cause !== undefined) pending.push(current.cause);
   }
@@ -108,14 +134,17 @@ function formatAcpAuthenticationError(
   if (errorCode && !details.some((detail) => detail.includes(errorCode))) {
     details.push(`Provider error code: ${errorCode}.`);
   }
-  const tail = error.stderr ? stderrTail(error.stderr) : "";
+  const tail = stderrTailForAcpError(error);
   if (tail && !details.some((detail) => detail.includes(tail))) {
     details.push(`Stderr tail: ${tail}`);
   }
-  return `${details.join("\n")}\n\n${grokAuthenticationRemediation(
-    authenticationMode,
-    error.code,
-  )}`;
+  const authenticationError =
+    error instanceof AcpAuthenticationError ? error : undefined;
+  return `${details.join("\n")}\n\n${grokAuthenticationRemediation({
+    authMethod: authenticationError?.authenticationMethod ?? authenticationMode,
+    code: error.code,
+    availableMethods: authenticationError?.availableAuthenticationMethods,
+  })}`;
 }
 
 const STRONG_AUTHENTICATION_FAILURE_DIAGNOSTICS = [
@@ -187,7 +216,15 @@ function containsAuthenticationFailureDiagnostic(
   ...sources: string[]
 ): boolean {
   return sources
-    .flatMap((source) => source.split(/[\r\n\u2028\u2029]+|;\s+/))
+    .flatMap((source) => {
+      const maxCodeUnits = 16 * 1024;
+      const half = maxCodeUnits / 2;
+      const bounded =
+        source.length <= maxCodeUnits
+          ? source
+          : `${source.slice(0, half)}\n${source.slice(-half)}`;
+      return bounded.split(/[\r\n\u2028\u2029]+|;\s+/);
+    })
     .map(normalizeAuthenticationDiagnostic)
     .filter(({ text }) => Boolean(text))
     .some(({ text, severity }) => {
@@ -263,8 +300,10 @@ export function mapAcpError(
   return new APICallError({
     message:
       error instanceof Error
-        ? error.message
-        : `Grok ACP call failed: ${String(error)}`,
+        ? isSanitizedAcpDiagnosticError(error)
+          ? error.message
+          : sanitizeDiagnosticMessage(error.message)
+        : sanitizeDiagnosticMessage(`Grok ACP call failed: ${String(error)}`),
     url: "grok-build://acp",
     requestBodyValues,
     cause: error,
@@ -285,13 +324,17 @@ export function mapGrokExecError(
     return error;
   }
   const cliError = error instanceof GrokCliError ? error : undefined;
-  const message = error instanceof Error ? error.message : String(error);
+  const message = cliError
+    ? cliError.message
+    : sanitizeDiagnosticMessage(
+        error instanceof Error ? error.message : String(error),
+      );
   const authenticationFailure =
     cliError !== undefined &&
     ["GROK_CLI_HEADLESS_ERROR", "GROK_CLI_PROCESS_EXIT"].includes(
       cliError.code,
     ) &&
-    containsAuthenticationFailureDiagnostic(message, cliError.stderr ?? "");
+    grokCliAuthenticationFailures.has(cliError);
   if (authenticationFailure) {
     return createGrokBuildAuthenticationError(message, error);
   }

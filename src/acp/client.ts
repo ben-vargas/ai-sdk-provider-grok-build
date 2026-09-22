@@ -14,7 +14,9 @@ import {
   AcpProtocolError,
   AcpSpawnError,
   AcpTimeoutError,
+  cloneAcpErrorWithContext,
   isAcpAuthenticationRpcError,
+  markAcpErrorMessageSanitized,
   stderrTail,
 } from "./errors.js";
 import type {
@@ -41,7 +43,7 @@ import type {
   AcpStopReason,
   AcpWriteTextFileParams,
   AcpWriteTextFileResult,
-  JsonRpcFailure,
+  JsonRpcErrorObject,
   JsonRpcId,
   JsonRpcRequest,
   JsonRpcSuccess,
@@ -328,26 +330,35 @@ function authMethodNotAvailableError(
   return new AcpAuthenticationError(message, {
     cause,
     code: "AUTH_METHOD_NOT_AVAILABLE",
+    authenticationMethod: methodId,
+    availableAuthenticationMethods: initialized.authMethods.map(
+      (method) => method.id,
+    ),
   });
 }
 
-function attachAuthenticationRetryCause(
+function withAuthenticationRetryContext(
   retryError: unknown,
   initialError: AcpJsonRpcError,
+  signal?: AbortSignal,
 ): unknown {
-  if (!(retryError instanceof Error)) return retryError;
-  const causes: unknown[] = [initialError];
-  if (retryError.cause !== undefined) causes.push(retryError.cause);
-  Object.defineProperty(retryError, "cause", {
-    configurable: true,
-    enumerable: true,
-    value: new AggregateError(
-      causes,
+  if (signal?.aborted && retryError === signal.reason) return retryError;
+  if (!(retryError instanceof AcpError)) return retryError;
+  return cloneAcpErrorWithContext(retryError, {
+    cause: new AggregateError(
+      [initialError, retryError],
       "ACP authentication retry failed after the initial session authentication failure.",
     ),
-    writable: true,
   });
-  return retryError;
+}
+
+function isJsonRpcErrorObject(value: unknown): value is JsonRpcErrorObject {
+  return (
+    isRecord(value) &&
+    typeof value.code === "number" &&
+    Number.isInteger(value.code) &&
+    typeof value.message === "string"
+  );
 }
 
 function sessionIdFromParams(params: unknown): string | undefined {
@@ -577,8 +588,7 @@ export class AcpClient {
 
     this.initializePromise = this.initializeInternal()
       .catch((error: unknown) => {
-        this.fail(error);
-        throw error;
+        throw this.fail(error);
       })
       .finally(() => {
         this.initializePromise = undefined;
@@ -607,9 +617,17 @@ export class AcpClient {
       );
     } catch (error) {
       if (isAcpAuthenticationRpcError(error)) {
+        const message = `Grok authentication with method '${methodId}' failed.\n${error.message}`;
         throw new AcpAuthenticationError(
-          `Grok authentication with method '${methodId}' failed.\n${error.message}`,
-          { cause: error, code: "AUTHENTICATION_FAILED" },
+          message,
+          markAcpErrorMessageSanitized(message, {
+            cause: error,
+            code: "AUTHENTICATION_FAILED",
+            authenticationMethod: methodId,
+            availableAuthenticationMethods: initialized.authMethods.map(
+              (method) => method.id,
+            ),
+          }),
         );
       }
       throw error;
@@ -797,37 +815,52 @@ export class AcpClient {
 
   private async initializeInternal(): Promise<AcpInitializeResult> {
     this.start();
-    const result = await this.requestInternal(
-      "initialize",
-      {
-        protocolVersion: 1,
-        clientCapabilities: {
-          fs: {
-            readTextFile:
-              (this.fileSystem.readTextFile !== undefined &&
-                this.fileSystem.readTextFile !== false) ||
-              this.requestHandlers.has("fs/read_text_file"),
-            writeTextFile:
-              (this.fileSystem.writeTextFile !== undefined &&
-                this.fileSystem.writeTextFile !== false) ||
-              this.requestHandlers.has("fs/write_text_file"),
+    try {
+      const result = await this.requestInternal(
+        "initialize",
+        {
+          protocolVersion: 1,
+          clientCapabilities: {
+            fs: {
+              readTextFile:
+                (this.fileSystem.readTextFile !== undefined &&
+                  this.fileSystem.readTextFile !== false) ||
+                this.requestHandlers.has("fs/read_text_file"),
+              writeTextFile:
+                (this.fileSystem.writeTextFile !== undefined &&
+                  this.fileSystem.writeTextFile !== false) ||
+                this.requestHandlers.has("fs/write_text_file"),
+            },
+            terminal: false,
           },
-          terminal: false,
         },
-      },
-      this.requestTimeoutMs,
-      undefined,
-    );
-
-    if (result.protocolVersion !== 1) {
-      throw new AcpProtocolError(
-        `Unsupported ACP protocol version ${result.protocolVersion}; this provider requires version 1.`,
-        { code: "UNSUPPORTED_PROTOCOL_VERSION" },
+        this.requestTimeoutMs,
+        undefined,
       );
-    }
 
-    this.initialized = result;
-    return result;
+      if (result.protocolVersion !== 1) {
+        throw new AcpProtocolError(
+          `Unsupported ACP protocol version ${result.protocolVersion}; this provider requires version 1.`,
+          { code: "UNSUPPORTED_PROTOCOL_VERSION" },
+        );
+      }
+
+      this.initialized = result;
+      return result;
+    } catch (error) {
+      if (
+        !(error instanceof AcpError) ||
+        !this.stderr ||
+        error === this.lastFailure ||
+        error.stderr
+      ) {
+        throw error;
+      }
+      throw cloneAcpErrorWithContext(error, {
+        cause: error,
+        stderr: this.stderr,
+      });
+    }
   }
 
   private async requestSessionWithAuthenticationRetry<
@@ -861,22 +894,34 @@ export class AcpClient {
       try {
         await this.authenticate(this.authMethod, signal);
       } catch (retryError) {
-        throw attachAuthenticationRetryCause(retryError, error);
+        throw withAuthenticationRetryContext(retryError, error, signal);
       }
-      return await this.requestInternal(
-        method,
-        params,
-        this.requestTimeoutMs,
-        signal,
-      );
+      try {
+        return await this.requestInternal(
+          method,
+          params,
+          this.requestTimeoutMs,
+          signal,
+        );
+      } catch (retryError) {
+        throw withAuthenticationRetryContext(retryError, error, signal);
+      }
     }
   }
 
   private withNewSessionAuthenticationContext(error: unknown): unknown {
     if (!isAcpAuthenticationRpcError(error)) return error;
+    const message = `Grok requires authentication.\n${error.message}`;
     return new AcpAuthenticationError(
-      `Grok requires authentication.\n${error.message}`,
-      { cause: error },
+      message,
+      markAcpErrorMessageSanitized(message, {
+        cause: error,
+        authenticationMethod:
+          typeof this.authMethod === "string" ? this.authMethod : undefined,
+        availableAuthenticationMethods: this.initialized?.authMethods.map(
+          (method) => method.id,
+        ),
+      }),
     );
   }
 
@@ -1313,14 +1358,11 @@ export class AcpClient {
     try {
       message = JSON.parse(line) as unknown;
     } catch (error) {
-      throw new AcpProtocolError(
-        `Invalid JSON from Grok ACP stdout: ${line.slice(0, 200)}`,
-        {
-          cause: error,
-          data: unterminatedAtEof ? { unterminatedAtEof: true } : undefined,
-          stderr: this.stderr,
-        },
-      );
+      throw new AcpProtocolError("Invalid JSON from Grok ACP stdout.", {
+        cause: error,
+        data: unterminatedAtEof ? { unterminatedAtEof: true } : undefined,
+        stderr: this.stderr,
+      });
     }
     if (!isRecord(message)) {
       throw new AcpProtocolError(
@@ -1363,8 +1405,12 @@ export class AcpClient {
     pending.responseReceived = true;
 
     if ("error" in record) {
-      const failure = record as unknown as JsonRpcFailure;
-      const error = new AcpJsonRpcError(pending.method, failure.error);
+      const error = isJsonRpcErrorObject(record.error)
+        ? new AcpJsonRpcError(pending.method, record.error)
+        : new AcpProtocolError(
+            `Grok ACP returned a malformed JSON-RPC error for '${pending.method}'.`,
+            { data: record.error as JsonValue },
+          );
       const callbackBarrier = this.responseCallbackBarrier(pending, undefined);
       void callbackBarrier.then(() => {
         this.settlePendingRequest(id, pending, () => pending.reject(error));
@@ -1793,10 +1839,19 @@ export class AcpClient {
     }
   }
 
-  private fail(error: unknown): void {
-    if (this.state === "disposed" || this.state === "exited") return;
-    const resolved =
+  private fail(error: unknown): Error {
+    const candidate =
       error instanceof Error ? error : new AcpError(errorMessage(error));
+    if (this.state === "disposed" || this.state === "exited") {
+      return this.lastFailure ?? candidate;
+    }
+    const resolved =
+      candidate instanceof AcpError && this.stderr && !candidate.stderr
+        ? cloneAcpErrorWithContext(candidate, {
+            cause: candidate,
+            stderr: this.stderr,
+          })
+        : candidate;
     this.clearProvisionalStdinFailureTimer();
     this.lastFailure = resolved;
     this.state = "exited";
@@ -1806,6 +1861,7 @@ export class AcpClient {
     if (!(resolved instanceof AcpSpawnError)) {
       void this.terminateAfterFailure();
     }
+    return resolved;
   }
 
   private rejectAll(error: Error): void {
