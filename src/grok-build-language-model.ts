@@ -12,14 +12,18 @@ import type {
 } from "@ai-sdk/provider";
 import { APICallError } from "@ai-sdk/provider";
 import { parseProviderOptions } from "@ai-sdk/provider-utils";
+import { abortError } from "./abort.js";
 import { AcpClient, type AcpClientOptions } from "./acp/client.js";
 import { AcpProtocolError } from "./acp/errors.js";
 import type {
   AcpConfigOption,
+  AcpConfigSelectChoice,
+  AcpConfigSelectGroup,
+  AcpConfigSelectOption,
   AcpExtensionNotification,
+  AcpLoadSessionResult,
   AcpMcpServer,
   AcpModelState,
-  AcpSessionResult,
 } from "./acp/protocol.js";
 import { mapAcpError, missingApiKeyError } from "./errors.js";
 import { ensureGrokCliVersion, resolveGrokCommand } from "./grok-cli.js";
@@ -33,7 +37,7 @@ import {
 } from "./normalized-usage.js";
 import { grokBuildProviderMetadata, mapGrokBuildUsage } from "./map-usage.js";
 import { GrokBuildV4StreamEmitter } from "./map-v4-events.js";
-import { redactSensitiveData } from "./redact.js";
+import { isRecord } from "./type-guards.js";
 import {
   grokBuildProviderOptionsSchema,
   type GrokBuildLogger,
@@ -51,7 +55,7 @@ export interface GrokBuildLanguageModelOptions {
   clientFactory?: AcpClientFactory;
   /** Internal: pooled providers retain clients after each call. */
   disposeClient?: boolean;
-  /** Internal: custom factories can opt into real CLI resolution/version checks. */
+  /** Opt a custom real-CLI factory into built-in resolution, validation, and arguments. */
   validateCli?: boolean;
 }
 
@@ -90,80 +94,6 @@ function currentReasoningEffort(
   )?._meta?.reasoningEffort;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function malformedAcpPayload(source: string, value: unknown): never {
-  throw new AcpProtocolError(`Grok returned malformed ${source}.`, {
-    data: redactSensitiveData(value),
-  });
-}
-
-function validateModelState(
-  value: unknown,
-  source: string,
-): AcpModelState | undefined {
-  if (value === undefined) return undefined;
-  if (
-    !isRecord(value) ||
-    typeof value.currentModelId !== "string" ||
-    value.currentModelId.trim().length === 0 ||
-    !Array.isArray(value.availableModels)
-  ) {
-    return malformedAcpPayload(source, value);
-  }
-  for (const model of value.availableModels) {
-    if (
-      !isRecord(model) ||
-      typeof model.modelId !== "string" ||
-      model.modelId.trim().length === 0 ||
-      typeof model.name !== "string" ||
-      model.name.trim().length === 0
-    ) {
-      return malformedAcpPayload(source, value);
-    }
-  }
-  return value as unknown as AcpModelState;
-}
-
-function validateConfigOptions(
-  value: unknown,
-  source: string,
-  required = false,
-): AcpConfigOption[] | undefined {
-  if (value === undefined && !required) return undefined;
-  if (!Array.isArray(value)) return malformedAcpPayload(source, value);
-  for (const option of value) {
-    if (
-      !isRecord(option) ||
-      typeof option.id !== "string" ||
-      option.id.trim().length === 0 ||
-      typeof option.type !== "string" ||
-      option.type.trim().length === 0 ||
-      (Object.hasOwn(option, "currentValue") &&
-        (typeof option.currentValue !== "string" ||
-          option.currentValue.trim().length === 0))
-    ) {
-      return malformedAcpPayload(source, value);
-    }
-    const choices = option.options;
-    if (choices !== undefined && !Array.isArray(choices)) {
-      return malformedAcpPayload(source, value);
-    }
-    for (const choice of choices ?? []) {
-      if (
-        !isRecord(choice) ||
-        typeof choice.value !== "string" ||
-        choice.value.trim().length === 0
-      ) {
-        return malformedAcpPayload(source, value);
-      }
-    }
-  }
-  return value as AcpConfigOption[];
-}
-
 function requestedReasoningEffort(
   options: LanguageModelV4CallOptions,
   providerOptions: GrokBuildProviderOptions | undefined,
@@ -174,15 +104,35 @@ function requestedReasoningEffort(
     : undefined;
 }
 
-function configOption(
+function selectConfigOption(
   options: AcpConfigOption[] | undefined,
   id: string,
-): AcpConfigOption | undefined {
-  return options?.find((option) => option.id === id);
+): AcpConfigSelectOption | undefined {
+  const option = options?.find((candidate) => candidate.id === id);
+  return option?.type === "select"
+    ? (option as AcpConfigSelectOption)
+    : undefined;
 }
 
-function configChoiceValues(option: AcpConfigOption | undefined): string[] {
-  return option?.options?.map((choice) => choice.value) ?? [];
+function isConfigSelectGroup(
+  value: AcpConfigSelectChoice | AcpConfigSelectGroup,
+): value is AcpConfigSelectGroup {
+  return Object.hasOwn(value, "group");
+}
+
+function configChoices(
+  option: AcpConfigSelectOption | undefined,
+): AcpConfigSelectChoice[] {
+  if (!option) return [];
+  return option.options.flatMap((item) =>
+    isConfigSelectGroup(item) ? item.options : [item],
+  );
+}
+
+function configChoiceValues(
+  option: AcpConfigSelectOption | undefined,
+): string[] {
+  return configChoices(option).map((choice) => choice.value);
 }
 
 export function buildAcpCommandArgs(
@@ -212,27 +162,20 @@ export function buildAcpCommandArgs(
 }
 
 function sessionResultModels(
-  result: AcpSessionResult | null | Record<string, never>,
+  result: AcpLoadSessionResult,
 ): AcpModelState | undefined {
-  return result && "models" in result
-    ? validateModelState(result.models, "session/load model state")
-    : undefined;
+  return result && "models" in result ? result.models : undefined;
 }
 
 function sessionResultConfigOptions(
-  result: AcpSessionResult | null | Record<string, never>,
+  result: AcpLoadSessionResult,
 ): AcpConfigOption[] | undefined {
-  return result && "configOptions" in result
-    ? validateConfigOptions(result.configOptions, "session/load config options")
-    : undefined;
+  return result && "configOptions" in result ? result.configOptions : undefined;
 }
 
 function throwIfAborted(signal: AbortSignal): void {
   if (!signal.aborted) return;
-  if (signal.reason instanceof Error) throw signal.reason;
-  const error = new Error("The Grok Build call was aborted.");
-  error.name = "AbortError";
-  throw error;
+  throw abortError(signal, "The Grok Build call was aborted.");
 }
 
 export class GrokBuildLanguageModel implements LanguageModelV4 {
@@ -563,28 +506,25 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
         signal,
       });
     }
-    const permissionMode =
-      providerOptions?.dangerouslySkipPermissions ||
-      this.settings.dangerouslySkipPermissions
-        ? "bypassPermissions"
-        : (providerOptions?.permissionMode ??
-          this.settings.permissionMode ??
-          "default");
+    const dangerouslySkipPermissions =
+      providerOptions?.dangerouslySkipPermissions ??
+      this.settings.dangerouslySkipPermissions ??
+      false;
+    const permissionMode = dangerouslySkipPermissions
+      ? "bypassPermissions"
+      : (providerOptions?.permissionMode ??
+        this.settings.permissionMode ??
+        "default");
     const alwaysApprove =
       providerOptions?.alwaysApprove ?? this.settings.alwaysApprove;
-    const dangerouslySkipPermissions = Boolean(
-      this.settings.dangerouslySkipPermissions ||
-      providerOptions?.dangerouslySkipPermissions,
-    );
     const args = buildAcpCommandArgs(resolvedCommand?.prefixArgs ?? [], {
       permissionMode,
       dangerouslySkipPermissions,
       alwaysApprove: Boolean(alwaysApprove),
       xaiApiBaseUrl: this.settings.xaiApiBaseUrl,
     });
-    const client = this.clientFactory({
+    const clientOptions: AcpClientOptions = {
       executable: resolvedCommand?.command ?? this.settings.executablePath,
-      args,
       cwd: this.settings.cwd,
       env,
       authMethod: authMethod === "api_key" ? false : authMethod,
@@ -596,7 +536,9 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
       cancelGraceMs: this.settings.timeouts?.cancelGraceMs,
       terminateGraceMs: this.settings.timeouts?.terminateGraceMs,
       killGraceMs: this.settings.timeouts?.killGraceMs,
-    });
+    };
+    if (this.validateCli) clientOptions.args = args;
+    const client = this.clientFactory(clientOptions);
     const releaseClientLease = client.acquireLease();
     let extensionConsumer:
       | ((event: AcpExtensionNotification) => void)
@@ -605,16 +547,8 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
     let unregisterExtension = (): void => undefined;
     const handleExtension = (event: AcpExtensionNotification): void => {
       if (!includeRawChunks && !includeExtensionEvents) return;
-      const params =
-        event.params && typeof event.params === "object"
-          ? (event.params as Record<string, unknown>)
-          : undefined;
-      const meta =
-        params?._meta &&
-        typeof params._meta === "object" &&
-        !Array.isArray(params._meta)
-          ? (params._meta as Record<string, unknown>)
-          : undefined;
+      const params = isRecord(event.params) ? event.params : undefined;
+      const meta = isRecord(params?._meta) ? params._meta : undefined;
       if (meta?.isReplay === true) return;
       if (
         activeSessionId !== undefined &&
@@ -633,10 +567,9 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
       for (let index = extensionEvents.length - 1; index >= 0; index--) {
         const params = extensionEvents[index]?.params;
         if (
-          params &&
-          typeof params === "object" &&
-          typeof (params as Record<string, unknown>).sessionId === "string" &&
-          (params as Record<string, unknown>).sessionId !== activeSessionId
+          isRecord(params) &&
+          typeof params.sessionId === "string" &&
+          params.sessionId !== activeSessionId
         ) {
           extensionEvents.splice(index, 1);
         }
@@ -645,10 +578,7 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
 
     try {
       const initialized = await client.initialize(signal);
-      const initializeModels = validateModelState(
-        initialized._meta?.modelState,
-        "initialize model state",
-      );
+      const initializeModels = initialized._meta?.modelState;
       const cwd = resolve(this.settings.cwd ?? process.cwd());
       const mcpServers = mergeMcpServers(
         this.settings.mcpServers,
@@ -686,18 +616,15 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
         const result = await client.newSession({ cwd, mcpServers }, signal);
         sessionId = result.sessionId;
         activeSessionId = sessionId;
-        models = validateModelState(result.models, "session/new model state");
-        configOptions = validateConfigOptions(
-          result.configOptions,
-          "session/new config options",
-        );
+        models = result.models;
+        configOptions = result.configOptions;
       }
       discardOtherSessionExtensions();
       models ??= initializeModels;
 
       const requestedModel = providerOptions?.model ?? this.modelId;
       if (requestedModel !== "default") {
-        const modelOption = configOption(configOptions, "model");
+        const modelOption = selectConfigOption(configOptions, "model");
         const choices = configChoiceValues(modelOption);
         if (
           modelOption &&
@@ -714,13 +641,9 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
             { sessionId, configId: "model", value: requestedModel },
             signal,
           );
-          configOptions = validateConfigOptions(
-            updated.configOptions,
-            "session/set_config_option config options",
-            true,
-          );
+          configOptions = updated.configOptions;
           if (
-            configOption(configOptions, "model")?.currentValue !==
+            selectConfigOption(configOptions, "model")?.currentValue !==
             requestedModel
           ) {
             throw new AcpProtocolError(
@@ -735,7 +658,10 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
         requestedReasoningEffort(options, providerOptions) ??
         this.settings.reasoningEffort;
       if (effort) {
-        const effortOption = configOption(configOptions, "reasoning_effort");
+        const effortOption = selectConfigOption(
+          configOptions,
+          "reasoning_effort",
+        );
         const choices = configChoiceValues(effortOption);
         if (effortOption && choices.length > 0 && !choices.includes(effort)) {
           warnings.push({
@@ -748,14 +674,10 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
             { sessionId, configId: "reasoning_effort", value: effort },
             signal,
           );
-          configOptions = validateConfigOptions(
-            updated.configOptions,
-            "session/set_config_option config options",
-            true,
-          );
+          configOptions = updated.configOptions;
           if (
-            configOption(configOptions, "reasoning_effort")?.currentValue !==
-            effort
+            selectConfigOption(configOptions, "reasoning_effort")
+              ?.currentValue !== effort
           ) {
             throw new AcpProtocolError(
               `Grok did not apply requested reasoning effort '${effort}'.`,
@@ -771,7 +693,10 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
         }
       }
 
-      const selectedModel = configOption(configOptions, "model")?.currentValue;
+      const selectedModel = selectConfigOption(
+        configOptions,
+        "model",
+      )?.currentValue;
       const resolvedModelId =
         selectedModel ?? models?.currentModelId ?? requestedModel;
       const requestedModelAvailable = models?.availableModels.some(
@@ -779,7 +704,7 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
       );
       if (
         requestedModel !== "default" &&
-        !configOption(configOptions, "model") &&
+        !selectConfigOption(configOptions, "model") &&
         models &&
         !requestedModelAvailable
       ) {
@@ -791,7 +716,7 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
       } else if (
         requestedModel !== "default" &&
         requestedModel !== resolvedModelId &&
-        !configOption(configOptions, "model")
+        !selectConfigOption(configOptions, "model")
       ) {
         warnings.push({
           type: "compatibility",
@@ -804,15 +729,17 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
         `Grok ACP session ${sessionId} prepared with model ${resolvedModelId}.`,
       );
       const currentEffort =
-        configOption(configOptions, "reasoning_effort")?.currentValue ??
+        selectConfigOption(configOptions, "reasoning_effort")?.currentValue ??
         currentReasoningEffort(models);
-      const supportedEfforts =
-        configOption(configOptions, "reasoning_effort")?.options?.map(
-          (item) => item.value,
-        ) ??
-        models?.availableModels
-          .find((model) => model.modelId === resolvedModelId)
-          ?._meta?.reasoningEfforts?.map((item) => item.value);
+      const selectedEffortOption = selectConfigOption(
+        configOptions,
+        "reasoning_effort",
+      );
+      const supportedEfforts = selectedEffortOption
+        ? configChoiceValues(selectedEffortOption)
+        : models?.availableModels
+            .find((model) => model.modelId === resolvedModelId)
+            ?._meta?.reasoningEfforts?.map((item) => item.value);
       return {
         client,
         releaseClientLease,

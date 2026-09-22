@@ -1,11 +1,14 @@
 import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import type {
   LanguageModelV4CallOptions,
   LanguageModelV4StreamPart,
 } from "@ai-sdk/provider";
-import { APICallError } from "@ai-sdk/provider";
+import { APICallError, LoadAPIKeyError } from "@ai-sdk/provider";
 import { describe, expect, it, vi } from "vitest";
 import {
   AcpClient,
@@ -215,7 +218,7 @@ describe("GrokBuildLanguageModel", () => {
     expect(args).not.toContain("--always-approve");
   });
 
-  it("passes complete ACP arguments to a custom client factory", async () => {
+  it("leaves ACP arguments undefined for a custom client factory", async () => {
     const child = new FixtureChild(readFixture("text-only.jsonl"));
     let captured: AcpClientOptions | undefined;
     const model = new GrokBuildLanguageModel({
@@ -238,16 +241,149 @@ describe("GrokBuildLanguageModel", () => {
 
     await model.doGenerate(promptOptions("ping"));
 
-    expect(captured?.args).toEqual([
-      "--no-auto-update",
-      "--permission-mode",
-      "plan",
-      "agent",
-      "--always-approve",
-      "--xai-api-base-url",
-      "https://api.example.test",
-      "stdio",
-    ]);
+    expect(captured?.args).toBeUndefined();
+    expect(captured).toMatchObject({
+      permissionMode: "plan",
+      alwaysApprove: true,
+      env: { XAI_API_BASE_URL: "https://api.example.test" },
+    });
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "opts a real-CLI custom factory into validation and generated arguments",
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), "grok-cli-fixture-"));
+      const executablePath = join(directory, "grok");
+      await writeFile(executablePath, '#!/bin/sh\nprintf "grok 1.2.3\\n"\n', {
+        mode: 0o755,
+      });
+      try {
+        const child = new FixtureChild(readFixture("text-only.jsonl"));
+        let captured: AcpClientOptions | undefined;
+        const model = new GrokBuildLanguageModel({
+          id: "grok-4.5",
+          settings: {
+            cwd: directory,
+            executablePath,
+            permissionMode: "plan",
+            alwaysApprove: true,
+            xaiApiBaseUrl: "https://api.example.test",
+          },
+          validateCli: true,
+          clientFactory: (options) => {
+            captured = options;
+            return new AcpClient({
+              ...options,
+              authMethod: false,
+              spawn: () => child,
+            });
+          },
+        });
+
+        await model.doGenerate(promptOptions("ping"));
+
+        expect(captured?.executable).toBe(executablePath);
+        expect(captured?.args).toEqual([
+          "--no-auto-update",
+          "--permission-mode",
+          "plan",
+          "agent",
+          "--always-approve",
+          "--xai-api-base-url",
+          "https://api.example.test",
+          "stdio",
+        ]);
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each([
+    {
+      providerValue: undefined,
+      callValue: undefined,
+      expected: "default",
+    },
+    {
+      providerValue: true,
+      callValue: undefined,
+      expected: "bypassPermissions",
+    },
+    { providerValue: true, callValue: false, expected: "default" },
+    { providerValue: false, callValue: true, expected: "bypassPermissions" },
+  ])(
+    "resolves dangerous permission bypass with provider=$providerValue and call=$callValue",
+    async ({ providerValue, callValue, expected }) => {
+      const child = new FixtureChild(readFixture("text-only.jsonl"));
+      let captured: AcpClientOptions | undefined;
+      const model = new GrokBuildLanguageModel({
+        id: "grok-4.5",
+        settings: {
+          cwd: "/fixture",
+          dangerouslySkipPermissions: providerValue,
+        },
+        clientFactory: (options) => {
+          captured = options;
+          return new AcpClient({
+            ...options,
+            authMethod: false,
+            spawn: () => child,
+          });
+        },
+      });
+      await model.doGenerate(
+        promptOptions("ping", {
+          ...(callValue === undefined
+            ? {}
+            : {
+                providerOptions: {
+                  "grok-build": {
+                    dangerouslySkipPermissions: callValue,
+                  },
+                },
+              }),
+        }),
+      );
+
+      expect(captured?.permissionMode).toBe(expected);
+      expect(captured?.args).toBeUndefined();
+    },
+  );
+
+  it("keeps permission mode and approval independent from a false dangerous override", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"));
+    let captured: AcpClientOptions | undefined;
+    const model = new GrokBuildLanguageModel({
+      id: "grok-4.5",
+      settings: {
+        cwd: "/fixture",
+        dangerouslySkipPermissions: true,
+        permissionMode: "plan",
+        alwaysApprove: true,
+      },
+      clientFactory: (options) => {
+        captured = options;
+        return new AcpClient({
+          ...options,
+          authMethod: false,
+          spawn: () => child,
+        });
+      },
+    });
+
+    await model.doGenerate(
+      promptOptions("ping", {
+        providerOptions: {
+          "grok-build": { dangerouslySkipPermissions: false },
+        },
+      }),
+    );
+
+    expect(captured).toMatchObject({
+      permissionMode: "plan",
+      alwaysApprove: true,
+    });
   });
 
   it("maps the captured ACP tool lifecycle into a complete V4 stream", async () => {
@@ -471,21 +607,13 @@ describe("GrokBuildLanguageModel", () => {
       jsonrpc: "2.0",
       id: initialize?.id,
       error: {
-        code: -32001,
+        code: -32000,
         message: "Authentication required; run grok login",
       },
     });
 
     const error = await pending.catch((value: unknown) => value);
-    expect(error).toBeInstanceOf(APICallError);
-    expect(error).toMatchObject({
-      isRetryable: true,
-      data: {
-        code: "JSON_RPC_ERROR",
-        rpcCode: -32001,
-        method: "initialize",
-      },
-    });
+    expect(error).toBeInstanceOf(LoadAPIKeyError);
   });
 
   it("maps malformed ACP JSON at the model boundary and terminates the agent", async () => {
@@ -958,6 +1086,136 @@ describe("GrokBuildLanguageModel", () => {
       currentReasoningEffort: "low",
       supportedReasoningEfforts: ["low", "high"],
       agentVersion: "1.0.34",
+    });
+  });
+
+  it("flattens grouped selects and ignores unrelated option kinds", async () => {
+    const { model, child } = fixtureModel(
+      "text-only.jsonl",
+      false,
+      ["session/new", "session/set_config_option"],
+      "grok-4.5",
+    );
+    const configOptions = (modelId: string, effort: string) => [
+      {
+        id: "model",
+        name: "Model",
+        type: "select",
+        currentValue: modelId,
+        options: [
+          {
+            group: "frontier",
+            name: "Frontier",
+            options: [
+              { value: "grok-4.6", name: "Grok 4.6" },
+              { value: "grok-4.5", name: "Grok 4.5" },
+            ],
+          },
+        ],
+      },
+      {
+        id: "reasoning_effort",
+        name: "Reasoning effort",
+        type: "select",
+        currentValue: effort,
+        options: [
+          {
+            group: "effort",
+            name: "Effort",
+            options: [
+              { value: "low", name: "Low" },
+              { value: "high", name: "High" },
+            ],
+          },
+        ],
+      },
+      {
+        id: "streaming",
+        name: "Streaming",
+        type: "boolean",
+        currentValue: true,
+      },
+      {
+        id: "future",
+        name: "Future",
+        type: "range",
+        currentValue: 2,
+      },
+    ];
+    const pending = model.doGenerate(
+      promptOptions("ping", { reasoning: "low" }),
+    );
+    await vi.waitFor(() =>
+      expect(
+        child.requests.some(
+          (request) => "method" in request && request.method === "session/new",
+        ),
+      ).toBe(true),
+    );
+    const sessionRequest = child.requests.find(
+      (request) => "method" in request && request.method === "session/new",
+    ) as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      id: sessionRequest.id,
+      result: {
+        sessionId: "session-grouped-config",
+        configOptions: configOptions("grok-4.6", "high"),
+      },
+    });
+
+    await vi.waitFor(() =>
+      expect(
+        child.requests.filter(
+          (request) =>
+            "method" in request &&
+            request.method === "session/set_config_option",
+        ),
+      ).toHaveLength(1),
+    );
+    const modelRequest = child.requests.find(
+      (request) =>
+        "method" in request && request.method === "session/set_config_option",
+    ) as JsonRpcRequest;
+    expect(modelRequest.params).toMatchObject({
+      configId: "model",
+      value: "grok-4.5",
+    });
+    child.send({
+      jsonrpc: "2.0",
+      id: modelRequest.id,
+      result: { configOptions: configOptions("grok-4.5", "high") },
+    });
+
+    await vi.waitFor(() =>
+      expect(
+        child.requests.filter(
+          (request) =>
+            "method" in request &&
+            request.method === "session/set_config_option",
+        ),
+      ).toHaveLength(2),
+    );
+    const configRequests = child.requests.filter(
+      (request) =>
+        "method" in request && request.method === "session/set_config_option",
+    ) as JsonRpcRequest[];
+    const effortRequest = configRequests[1] as JsonRpcRequest;
+    expect(effortRequest.params).toMatchObject({
+      configId: "reasoning_effort",
+      value: "low",
+    });
+    child.send({
+      jsonrpc: "2.0",
+      id: effortRequest.id,
+      result: { configOptions: configOptions("grok-4.5", "low") },
+    });
+
+    const result = await pending;
+    expect(result.providerMetadata?.["grok-build"]).toMatchObject({
+      resolvedModel: "grok-4.5",
+      currentReasoningEffort: "low",
+      supportedReasoningEfforts: ["low", "high"],
     });
   });
 

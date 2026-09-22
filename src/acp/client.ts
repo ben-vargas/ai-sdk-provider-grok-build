@@ -4,6 +4,7 @@ import { isAbsolute } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { Readable, Writable } from "node:stream";
 import { abortError, waitAbortably } from "../abort.js";
+import { isRecord } from "../type-guards.js";
 import {
   AcpAuthenticationError,
   AcpError,
@@ -13,6 +14,7 @@ import {
   AcpProtocolError,
   AcpSpawnError,
   AcpTimeoutError,
+  isAcpAuthenticationRpcError,
 } from "./errors.js";
 import type {
   AcpAgentRequestMap,
@@ -44,6 +46,7 @@ import type {
   JsonRpcSuccess,
   JsonValue,
 } from "./protocol.js";
+import { validateAcpResponse } from "./validation.js";
 
 const DEFAULT_ARGS = ["--no-auto-update", "agent", "stdio"];
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -51,7 +54,25 @@ const DEFAULT_STDERR_LIMIT = 32_768;
 const CANCEL_GRACE_MS = 250;
 const TERMINATE_GRACE_MS = 500;
 const KILL_GRACE_MS = 250;
+const PROCESS_OUTPUT_DRAIN_GRACE_MS = 500;
+const TERMINAL_STDIN_FAILURE_GRACE_MS = 500;
 const ACP_ABORT_MESSAGE = "The ACP operation was aborted.";
+const SESSIONLESS_AGENT_REQUEST_QUEUE = Symbol("sessionless-agent-request");
+const SESSIONLESS_CALLBACK_QUEUE = Symbol("sessionless-callback");
+const TERMINAL_STDIN_FAILURE_CODES = new Set([
+  "ECANCELED",
+  "ECONNABORTED",
+  "EPIPE",
+  "ECONNRESET",
+  "ENOTCONN",
+  "ESHUTDOWN",
+  "EOF",
+  "ERR_STREAM_DESTROYED",
+  "ERR_STREAM_PREMATURE_CLOSE",
+  "ERR_STREAM_WRITE_AFTER_END",
+  "STDIN_CLOSED",
+  "STDIN_NOT_WRITABLE",
+]);
 
 export type PermissionMode =
   | "default"
@@ -164,19 +185,49 @@ type RequestHandler<Method extends keyof AcpAgentRequestMap> = (
   | Promise<AcpAgentRequestMap[Method]["result"]>;
 
 interface PendingRequest {
-  method: string;
+  method: keyof AcpRequestMap;
+  sessionId?: string;
+  responseReceived: boolean;
   resolve(value: unknown): void;
   reject(error: unknown): void;
   timer: NodeJS.Timeout;
   cleanup(): void;
 }
 
+interface PromptUpdateRegistration {
+  active: boolean;
+  handler(update: AcpSessionUpdateParams): void | Promise<void>;
+}
+
 interface PendingPermission {
   sessionId: string;
+  cancelled: boolean;
+  cancellation: Promise<AcpRequestPermissionResult>;
   cancel(): void;
 }
 
 type ClientState = "idle" | "running" | "disposed" | "exited";
+type CallbackQueueKey = string | typeof SESSIONLESS_CALLBACK_QUEUE;
+
+interface AcpClientLifecycle {
+  terminalFailure: Promise<Error>;
+  resolveTerminalFailure(error: Error): void;
+}
+
+const clientLifecycles = new WeakMap<AcpClient, AcpClientLifecycle>();
+
+function lifecycleFor(client: AcpClient): AcpClientLifecycle {
+  const lifecycle = clientLifecycles.get(client);
+  if (!lifecycle) throw new Error("AcpClient lifecycle was not initialized.");
+  return lifecycle;
+}
+
+/** @internal Used by the provider-local pool to retire failed clients safely. */
+export function waitForAcpClientTerminalFailure(
+  client: AcpClient,
+): Promise<Error> {
+  return lifecycleFor(client).terminalFailure;
+}
 
 /** Incremental UTF-8 NDJSON framing, including split code points and split lines. */
 export class NdjsonFramer {
@@ -257,10 +308,12 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function isAuthenticationRpcError(error: unknown): boolean {
-  if (!(error instanceof AcpJsonRpcError)) return false;
-  const normalized = `${error.rpcCode} ${error.message}`.toLowerCase();
-  return /auth|login|token|unauthori[sz]ed|401/.test(normalized);
+function sessionIdFromParams(params: unknown): string | undefined {
+  return isRecord(params) &&
+    typeof params.sessionId === "string" &&
+    params.sessionId.length > 0
+    ? params.sessionId
+    : undefined;
 }
 
 export class AcpClient {
@@ -294,14 +347,18 @@ export class AcpClient {
   >();
   private readonly promptHandlers = new Map<
     string,
-    Set<(update: AcpSessionUpdateParams) => void | Promise<void>>
+    Set<PromptUpdateRegistration>
   >();
   private readonly activeSessions = new Set<string>();
   private readonly sessionQueues = new Map<string, Promise<void>>();
+  private readonly agentRequestQueues = new Map<
+    string | typeof SESSIONLESS_AGENT_REQUEST_QUEUE,
+    Promise<void>
+  >();
   private readonly pendingPermissions = new Map<JsonRpcId, PendingPermission>();
-  private readonly agentRequestTasks = new Set<Promise<void>>();
   private writeQueue: Promise<void> = Promise.resolve();
   private readQueue: Promise<void> = Promise.resolve();
+  private readonly callbackQueues = new Map<CallbackQueueKey, Promise<void>>();
   private initializePromise?: Promise<AcpInitializeResult>;
   private initialized?: AcpInitializeResult;
   private stderr = "";
@@ -309,13 +366,33 @@ export class AcpClient {
   private exitPromise?: Promise<void>;
   private resolveExit?: () => void;
   private stdoutEndPromise?: Promise<void>;
+  private stderrEndPromise?: Promise<void>;
+  private readFailure?: Error;
+  private provisionalStdinFailure?: AcpError;
+  private provisionalStdinFailureTimer?: NodeJS.Timeout;
+  private childStarted = false;
   private childExited = false;
   private shutdownRequested = false;
+  private shutdownError?: AcpError;
   private cancellationRequested = false;
   private disposePromise?: Promise<void>;
   private activeLeases = 0;
 
   constructor(options: AcpClientOptions = {}) {
+    let resolveTerminalFailure!: (error: Error) => void;
+    let terminalFailureSettled = false;
+    const terminalFailure = new Promise<Error>((resolve) => {
+      resolveTerminalFailure = resolve;
+    });
+    clientLifecycles.set(this, {
+      terminalFailure,
+      resolveTerminalFailure: (error) => {
+        if (terminalFailureSettled) return;
+        terminalFailureSettled = true;
+        resolveTerminalFailure(error);
+      },
+    });
+
     const resolved = resolveAcpClientOptions(options);
     this.executable = resolved.executable;
     this.args = resolved.args;
@@ -352,6 +429,7 @@ export class AcpClient {
     return (
       !this.shutdownRequested &&
       !this.childExited &&
+      this.provisionalStdinFailure === undefined &&
       this.state !== "disposed" &&
       this.state !== "exited"
     );
@@ -365,8 +443,9 @@ export class AcpClient {
       this.pending.size === 0 &&
       this.activeSessions.size === 0 &&
       this.sessionQueues.size === 0 &&
-      this.pendingPermissions.size === 0 &&
-      this.agentRequestTasks.size === 0
+      this.callbackQueues.size === 0 &&
+      this.agentRequestQueues.size === 0 &&
+      this.pendingPermissions.size === 0
     );
   }
 
@@ -375,9 +454,14 @@ export class AcpClient {
    * This is primarily intended for integrations that pool AcpClient instances.
    */
   acquireLease(): () => void {
-    if (!this.isUsable) {
+    if (
+      this.shutdownRequested ||
+      this.state === "disposed" ||
+      this.state === "exited"
+    ) {
       throw (
         this.lastFailure ??
+        this.shutdownError ??
         new AcpError("Cannot lease an exited or disposed AcpClient.", {
           code: "CLIENT_DISPOSED",
         })
@@ -412,9 +496,29 @@ export class AcpClient {
 
   async initialize(signal?: AbortSignal): Promise<AcpInitializeResult> {
     if (signal?.aborted) throw abortError(signal, ACP_ABORT_MESSAGE);
+    if (this.shutdownRequested) {
+      throw (
+        this.lastFailure ??
+        this.shutdownError ??
+        new AcpError("Cannot initialize a disposing AcpClient.", {
+          code: "CLIENT_DISPOSED",
+        })
+      );
+    }
+    if (
+      this.provisionalStdinFailure !== undefined ||
+      (this.childExited && this.lastFailure === undefined)
+    ) {
+      throw await waitAbortably(
+        waitForAcpClientTerminalFailure(this),
+        signal,
+        ACP_ABORT_MESSAGE,
+      );
+    }
     if (!this.isUsable) {
       throw (
         this.lastFailure ??
+        this.shutdownError ??
         new AcpError("Cannot initialize an exited or disposed AcpClient.", {
           code: "CLIENT_DISPOSED",
         })
@@ -467,15 +571,13 @@ export class AcpClient {
         signal,
       );
     } catch (error) {
-      if (
-        signal?.aborted ||
-        (error instanceof Error && error.name === "AbortError")
-      )
-        throw error;
-      throw new AcpAuthenticationError(
-        `Grok authentication with method '${methodId}' failed. Run 'grok login' to refresh the cached CLI login, or configure XAI_API_KEY as an alternative.`,
-        { cause: error, stderr: this.stderr, code: "AUTHENTICATION_FAILED" },
-      );
+      if (isAcpAuthenticationRpcError(error)) {
+        throw new AcpAuthenticationError(
+          `Grok authentication with method '${methodId}' failed. Run 'grok login' to refresh the cached CLI login, or configure XAI_API_KEY as an alternative.`,
+          { cause: error, stderr: this.stderr, code: "AUTHENTICATION_FAILED" },
+        );
+      }
+      throw error;
     }
   }
 
@@ -510,7 +612,7 @@ export class AcpClient {
         signal,
       );
     } catch (error) {
-      if (isAuthenticationRpcError(error)) {
+      if (isAcpAuthenticationRpcError(error)) {
         throw new AcpAuthenticationError(
           "Grok requires authentication. Run 'grok login' for cached subscription authentication or configure XAI_API_KEY.",
           { cause: error, stderr: this.stderr },
@@ -606,11 +708,17 @@ export class AcpClient {
     const signal = options.signal;
     if (signal?.aborted) throw abortError(signal, ACP_ABORT_MESSAGE);
 
-    const handler = options.onUpdate;
+    const registration: PromptUpdateRegistration | undefined = options.onUpdate
+      ? { active: true, handler: options.onUpdate }
+      : undefined;
+    const deactivateRegistration = (): void => {
+      if (registration) registration.active = false;
+    };
+    signal?.addEventListener("abort", deactivateRegistration, { once: true });
     this.activeSessions.add(params.sessionId);
-    if (handler) {
+    if (registration) {
       const handlers = this.promptHandlers.get(params.sessionId) ?? new Set();
-      handlers.add(handler);
+      handlers.add(registration);
       this.promptHandlers.set(params.sessionId, handlers);
     }
 
@@ -632,10 +740,12 @@ export class AcpClient {
       }
       throw error;
     } finally {
+      signal?.removeEventListener("abort", deactivateRegistration);
       this.activeSessions.delete(params.sessionId);
-      if (handler) {
+      if (registration) {
+        deactivateRegistration();
         const handlers = this.promptHandlers.get(params.sessionId);
-        handlers?.delete(handler);
+        handlers?.delete(registration);
         if (handlers?.size === 0) this.promptHandlers.delete(params.sessionId);
       }
     }
@@ -643,9 +753,7 @@ export class AcpClient {
 
   async cancelSession(sessionId: string): Promise<void> {
     this.cancellationRequested = true;
-    for (const permission of this.pendingPermissions.values()) {
-      if (permission.sessionId === sessionId) permission.cancel();
-    }
+    this.cancelPendingPermissions(sessionId);
     await this.notify("session/cancel", { sessionId });
   }
 
@@ -709,7 +817,7 @@ export class AcpClient {
         signal,
       );
     } catch (error) {
-      if (!isAuthenticationRpcError(error) || this.authMethod === false)
+      if (!isAcpAuthenticationRpcError(error) || this.authMethod === false)
         throw error;
       await this.authenticate(this.authMethod, signal);
       return await this.requestInternal(
@@ -726,22 +834,26 @@ export class AcpClient {
     const disposalError = new AcpError("AcpClient was disposed.", {
       code: "CLIENT_DISPOSED",
     });
+    this.shutdownError = disposalError;
     if (this.state === "idle") {
       this.state = "disposed";
       this.rejectAll(disposalError);
+      lifecycleFor(this).resolveTerminalFailure(disposalError);
       return;
     }
-    if (
-      this.state === "exited" &&
-      this.lastFailure instanceof AcpSpawnError &&
-      this.lastFailure.code === "ENOENT"
-    ) {
+    if (this.state === "exited" && this.lastFailure instanceof AcpSpawnError) {
       this.state = "disposed";
       this.rejectAll(disposalError);
+      lifecycleFor(this).resolveTerminalFailure(this.lastFailure);
       return;
     }
 
     this.shutdownRequested = true;
+    this.clearProvisionalStdinFailureTimer();
+    if (this.provisionalStdinFailure) {
+      lifecycleFor(this).resolveTerminalFailure(this.provisionalStdinFailure);
+    }
+    this.cancelPendingPermissions();
     if (this.state === "running") {
       const sessionIds = [...this.activeSessions];
       await Promise.allSettled(
@@ -772,9 +884,8 @@ export class AcpClient {
 
     this.state = "disposed";
     this.rejectAll(disposalError);
+    lifecycleFor(this).resolveTerminalFailure(disposalError);
     this.activeSessions.clear();
-    this.pendingPermissions.forEach((permission) => permission.cancel());
-    this.pendingPermissions.clear();
   }
 
   private async waitForExit(timeoutMs: number): Promise<boolean> {
@@ -828,6 +939,7 @@ export class AcpClient {
       throw this.createSpawnError(error);
     }
     this.state = "running";
+    this.childStarted = this.child.pid !== undefined;
     this.childExited = false;
     this.exitPromise = new Promise((resolve) => {
       this.resolveExit = resolve;
@@ -836,25 +948,80 @@ export class AcpClient {
     this.stdoutEndPromise = new Promise((resolve) => {
       resolveStdoutEnd = resolve;
     });
-
-    const framer = new NdjsonFramer((line) => {
-      this.readQueue = this.readQueue
-        .then(async () => await this.handleLine(line))
-        .catch((error: unknown) => this.fail(error));
+    let resolveStderrEnd: (() => void) | undefined;
+    this.stderrEndPromise = new Promise((resolve) => {
+      resolveStderrEnd = resolve;
     });
-    this.child.stdout.on("data", (chunk: Buffer | string) =>
-      framer.push(chunk),
-    );
+
+    let flushingUnterminatedLine = false;
+    const framer = new NdjsonFramer((line) => {
+      const unterminatedAtEof = flushingUnterminatedLine;
+      this.readQueue = this.readQueue
+        .then(async () => await this.handleLine(line, unterminatedAtEof))
+        .catch((error: unknown) => {
+          if (this.shutdownRequested) return;
+          if (this.childExited) {
+            this.readFailure ??=
+              error instanceof Error
+                ? error
+                : new AcpError(errorMessage(error));
+            return;
+          }
+          this.fail(error);
+        });
+    });
+    this.child.stdout.on("data", (chunk: Buffer | string) => {
+      this.childStarted = true;
+      framer.push(chunk);
+    });
     this.child.stdout.on("end", () => {
-      framer.end();
+      flushingUnterminatedLine = true;
+      try {
+        framer.end();
+      } finally {
+        flushingUnterminatedLine = false;
+      }
       resolveStdoutEnd?.();
     });
-    this.child.stderr.on("data", (chunk: Buffer | string) =>
-      this.captureStderr(chunk),
-    );
-    this.child.on("error", (error) => this.fail(this.createSpawnError(error)));
+    this.child.stderr.on("data", (chunk: Buffer | string) => {
+      this.childStarted = true;
+      this.captureStderr(chunk);
+    });
+    this.child.stderr.on("end", () => resolveStderrEnd?.());
+    this.child.stdin.on("error", (error) => {
+      if (
+        !this.shutdownRequested &&
+        !this.childExited &&
+        this.state === "running"
+      ) {
+        void this.resolveStdinFailure(this.createStdinError(error));
+      }
+    });
+    this.child.stdin.on("close", () => {
+      if (
+        !this.shutdownRequested &&
+        !this.childExited &&
+        this.state === "running"
+      ) {
+        void this.resolveStdinFailure(
+          new AcpError("Grok ACP stdin closed while the process was running.", {
+            code: "STDIN_CLOSED",
+          }),
+        );
+      }
+    });
+    this.child.on("error", (error) => {
+      if (this.shutdownRequested || this.childExited) return;
+      this.fail(
+        this.isSpawnFailure(error)
+          ? this.createSpawnError(error)
+          : this.createRuntimeProcessError(error),
+      );
+    });
     this.child.on("exit", (code, signal) => {
       this.childExited = true;
+      this.clearProvisionalStdinFailureTimer();
+      this.cancelPendingPermissions();
       this.resolveExit?.();
       void this.handleProcessExit(code, signal);
     });
@@ -864,22 +1031,56 @@ export class AcpClient {
     code: number | null,
     signal: NodeJS.Signals | null,
   ): Promise<void> {
-    await this.stdoutEndPromise;
-    await this.readQueue;
+    await this.waitForProcessOutputDrain();
     if (
       this.state === "disposed" ||
       this.state === "exited" ||
       this.shutdownRequested
     )
       return;
-    const error = new AcpProcessExitError(code, signal, {
-      stderr: this.stderr,
+    if (this.readFailure) {
+      const readFailure = this.readFailure;
+      const protocolError = new AcpProtocolError(readFailure.message, {
+        cause: readFailure,
+        code:
+          readFailure instanceof AcpError ? readFailure.code : "PROTOCOL_ERROR",
+        data: readFailure instanceof AcpError ? readFailure.data : undefined,
+        stderr: this.stderr,
+        exitCode: code,
+        signal,
+      });
+      const unterminatedAtEof =
+        readFailure instanceof AcpError &&
+        isRecord(readFailure.data) &&
+        readFailure.data.unterminatedAtEof === true;
+      this.fail(
+        unterminatedAtEof && (code !== 0 || signal !== null)
+          ? new AcpProcessExitError(code, signal, {
+              cause: protocolError,
+              stderr: this.stderr,
+            })
+          : protocolError,
+      );
+      return;
+    }
+    this.fail(
+      new AcpProcessExitError(code, signal, {
+        stderr: this.stderr,
+      }),
+    );
+  }
+
+  private async waitForProcessOutputDrain(): Promise<void> {
+    const drained = Promise.all([
+      this.stdoutEndPromise,
+      this.stderrEndPromise,
+    ]).then(async () => await this.readQueue);
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, PROCESS_OUTPUT_DRAIN_GRACE_MS);
     });
-    this.lastFailure = error;
-    this.state = "exited";
-    if (this.pending.size > 0) this.rejectAll(error);
-    this.pendingPermissions.forEach((permission) => permission.cancel());
-    this.pendingPermissions.clear();
+    await Promise.race([drained, deadline]);
+    if (timer) clearTimeout(timer);
   }
 
   private createSpawnError(error: unknown): AcpSpawnError {
@@ -899,6 +1100,42 @@ export class AcpClient {
     );
   }
 
+  private createStdinError(error: unknown): AcpError {
+    if (error instanceof AcpError) return error;
+    const nodeError = error as NodeJS.ErrnoException;
+    return new AcpError(
+      `Failed to write to Grok ACP stdin: ${errorMessage(error)}`,
+      {
+        cause: error,
+        code: nodeError.code ?? "STDIN_WRITE_FAILED",
+        stderr: this.stderr,
+      },
+    );
+  }
+
+  private createRuntimeProcessError(error: unknown): AcpError {
+    const nodeError = error as NodeJS.ErrnoException | undefined;
+    return new AcpError(
+      `Grok ACP process emitted an error: ${errorMessage(error)}`,
+      {
+        cause: error,
+        code: nodeError?.code ?? "PROCESS_ERROR",
+        stderr: this.stderr,
+      },
+    );
+  }
+
+  private isSpawnFailure(error: unknown): boolean {
+    const nodeError = error as NodeJS.ErrnoException | undefined;
+    if (
+      typeof nodeError?.syscall === "string" &&
+      /^spawn(?:\s|$)/i.test(nodeError.syscall)
+    ) {
+      return true;
+    }
+    return !this.childStarted && this.child?.pid === undefined;
+  }
+
   private requestInternal<Method extends keyof AcpRequestMap>(
     method: Method,
     params: AcpRequestMap[Method]["params"],
@@ -913,62 +1150,116 @@ export class AcpClient {
     return new Promise<AcpRequestMap[Method]["result"]>((resolve, reject) => {
       const cleanupAbort = (): void =>
         signal?.removeEventListener("abort", onAbort);
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        cleanupAbort();
-        reject(new AcpTimeoutError(method, timeoutMs, { stderr: this.stderr }));
-      }, timeoutMs);
       const onAbort = (): void => {
-        const pending = this.pending.get(id);
-        if (!pending) return;
-        clearTimeout(pending.timer);
-        this.pending.delete(id);
-        pending.cleanup();
-        reject(abortError(signal as AbortSignal, ACP_ABORT_MESSAGE));
+        this.settlePendingRequest(id, pending, () => {
+          reject(abortError(signal as AbortSignal, ACP_ABORT_MESSAGE));
+        });
       };
-      signal?.addEventListener("abort", onAbort, { once: true });
-
-      this.pending.set(id, {
+      const pending: PendingRequest = {
         method,
+        sessionId: sessionIdFromParams(params),
+        responseReceived: false,
         resolve,
         reject,
-        timer,
+        timer: setTimeout(() => {
+          this.settlePendingRequest(id, pending, () => {
+            reject(
+              new AcpTimeoutError(method, timeoutMs, { stderr: this.stderr }),
+            );
+          });
+        }, timeoutMs),
         cleanup: cleanupAbort,
-      });
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      this.pending.set(id, pending);
 
       void this.writeMessage({ jsonrpc: "2.0", id, method, params }).catch(
         (error: unknown) => {
-          const pending = this.pending.get(id);
-          if (!pending) return;
-          clearTimeout(pending.timer);
-          this.pending.delete(id);
-          pending.cleanup();
-          pending.reject(error);
+          this.settlePendingRequest(id, pending, () => {
+            pending.reject(error);
+          });
         },
       );
     });
   }
 
+  private settlePendingRequest(
+    id: JsonRpcId,
+    pending: PendingRequest,
+    settle: () => void,
+  ): void {
+    if (this.pending.get(id) !== pending) return;
+    this.pending.delete(id);
+    clearTimeout(pending.timer);
+    pending.cleanup();
+    if (this.shutdownRequested && this.shutdownError) {
+      pending.reject(this.shutdownError);
+      return;
+    }
+    settle();
+  }
+
   private writeMessage(message: object): Promise<void> {
     const operation = this.writeQueue.then(async () => {
-      if (!this.child || this.state !== "running") {
+      if (!this.child || this.state !== "running" || this.childExited) {
         throw (
           this.lastFailure ?? new AcpError("Grok ACP process is not running.")
         );
       }
       const data = `${JSON.stringify(message)}\n`;
-      if (!this.child.stdin.write(data)) {
-        await new Promise<void>((resolve, reject) => {
-          this.child?.stdin.once("drain", resolve);
-          this.child?.stdin.once("error", reject);
-        });
-      }
+      const stdin = this.child.stdin;
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const cleanup = (): void => {
+          stdin.removeListener("error", onError);
+          stdin.removeListener("close", onClose);
+        };
+        const settle = (error?: unknown): void => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          if (error === undefined || error === null) {
+            this.childStarted = true;
+            resolve();
+          } else {
+            void this.resolveStdinFailure(this.createStdinError(error)).then(
+              reject,
+            );
+          }
+        };
+        const onError = (error: Error): void => settle(error);
+        const onClose = (): void =>
+          settle(
+            new AcpError("Grok ACP stdin closed before the write completed.", {
+              code: "STDIN_CLOSED",
+            }),
+          );
+
+        stdin.once("error", onError);
+        stdin.once("close", onClose);
+        if (stdin.destroyed || stdin.writableEnded || !stdin.writable) {
+          settle(
+            new AcpError("Grok ACP stdin is not writable.", {
+              code: "STDIN_NOT_WRITABLE",
+            }),
+          );
+          return;
+        }
+        try {
+          stdin.write(data, (error) => settle(error));
+        } catch (error) {
+          settle(error);
+        }
+      });
     });
     this.writeQueue = operation.catch(() => undefined);
     return operation;
   }
 
-  private async handleLine(line: string): Promise<void> {
+  private async handleLine(
+    line: string,
+    unterminatedAtEof = false,
+  ): Promise<void> {
     let message: unknown;
     try {
       message = JSON.parse(line) as unknown;
@@ -977,11 +1268,12 @@ export class AcpClient {
         `Invalid JSON from Grok ACP stdout: ${line.slice(0, 200)}`,
         {
           cause: error,
+          data: unterminatedAtEof ? { unterminatedAtEof: true } : undefined,
           stderr: this.stderr,
         },
       );
     }
-    if (!message || typeof message !== "object" || Array.isArray(message)) {
+    if (!isRecord(message)) {
       throw new AcpProtocolError(
         "Grok ACP emitted a non-object JSON-RPC message.",
         {
@@ -990,7 +1282,7 @@ export class AcpClient {
       );
     }
 
-    const record = message as Record<string, unknown>;
+    const record = message;
     if (
       "id" in record &&
       ("result" in record || "error" in record) &&
@@ -1005,12 +1297,12 @@ export class AcpClient {
       );
     }
     if ("id" in record) {
-      this.dispatchAgentRequest(record as unknown as JsonRpcRequest);
+      if (!this.childExited) {
+        this.enqueueAgentRequest(record as unknown as JsonRpcRequest);
+      }
       return;
     }
-    await this.handleNotification(
-      record as unknown as AcpExtensionNotification,
-    );
+    this.enqueueNotification(record as unknown as AcpExtensionNotification);
   }
 
   private handleResponse(record: Record<string, unknown>): void {
@@ -1018,42 +1310,104 @@ export class AcpClient {
     if (id === null) return;
     const pending = this.pending.get(id);
     if (!pending) return;
-    clearTimeout(pending.timer);
-    this.pending.delete(id);
-    pending.cleanup();
+    if (pending.responseReceived) return;
+    pending.responseReceived = true;
 
     if ("error" in record) {
       const failure = record as unknown as JsonRpcFailure;
-      pending.reject(
-        new AcpJsonRpcError(pending.method, failure.error, {
-          stderr: this.stderr,
-        }),
-      );
+      const error = new AcpJsonRpcError(pending.method, failure.error, {
+        stderr: this.stderr,
+      });
+      const callbackBarrier = this.responseCallbackBarrier(pending, undefined);
+      void callbackBarrier.then(() => {
+        this.settlePendingRequest(id, pending, () => pending.reject(error));
+      });
     } else {
-      pending.resolve((record as unknown as JsonRpcSuccess).result);
+      try {
+        const result = validateAcpResponse(
+          pending.method,
+          (record as unknown as JsonRpcSuccess).result,
+        );
+        const callbackBarrier = this.responseCallbackBarrier(pending, result);
+        void callbackBarrier.then(() => {
+          this.settlePendingRequest(id, pending, () => pending.resolve(result));
+        });
+      } catch (error) {
+        const callbackBarrier = this.responseCallbackBarrier(
+          pending,
+          undefined,
+        );
+        void callbackBarrier.then(() => {
+          this.settlePendingRequest(id, pending, () => pending.reject(error));
+        });
+      }
     }
   }
 
-  private async handleNotification(
-    notification: AcpExtensionNotification,
+  private responseCallbackBarrier(
+    pending: PendingRequest,
+    result: unknown,
   ): Promise<void> {
+    const keys = new Set<CallbackQueueKey>();
+    if (pending.sessionId) keys.add(pending.sessionId);
+    else keys.add(SESSIONLESS_CALLBACK_QUEUE);
+    if (pending.method === "session/new") {
+      const resultSessionId = sessionIdFromParams(result);
+      if (resultSessionId) keys.add(resultSessionId);
+    }
+    return Promise.all(
+      [...keys].map(async (key) => await this.callbackBarrier(key)),
+    ).then(() => undefined);
+  }
+
+  private callbackBarrier(key: CallbackQueueKey): Promise<void> {
+    return this.callbackQueues.get(key) ?? Promise.resolve();
+  }
+
+  private enqueueNotification(notification: AcpExtensionNotification): void {
+    const callbacks: Array<() => Promise<void>> = [];
+    const notificationSessionId = sessionIdFromParams(notification.params);
+    const queueKey = notificationSessionId ?? SESSIONLESS_CALLBACK_QUEUE;
     if (notification.method === "session/update") {
       const params = notification.params as AcpSessionUpdateParams;
       if (!params || typeof params.sessionId !== "string" || !params.update) {
         throw new AcpProtocolError("Malformed 'session/update' notification.");
       }
-      await this.invokeSafely(this.onUpdate, params);
+      if (this.onUpdate) {
+        const handler = this.onUpdate;
+        callbacks.push(async () => await this.invokeSafely(handler, params));
+      }
       const handlers = this.promptHandlers.get(params.sessionId);
       if (handlers) {
-        for (const handler of handlers) {
-          await this.invokeSafely(handler, params);
+        for (const registration of [...handlers]) {
+          callbacks.push(async () => {
+            if (!registration.active) return;
+            await this.invokeSafely(registration.handler, params);
+          });
         }
       }
-      return;
+    } else {
+      for (const handler of [...this.extensionHandlers]) {
+        callbacks.push(
+          async () => await this.invokeSafely(handler, notification),
+        );
+      }
     }
-    for (const handler of this.extensionHandlers) {
-      await this.invokeSafely(handler, notification);
-    }
+
+    if (callbacks.length === 0) return;
+    const task = this.callbackBarrier(queueKey).then(async () => {
+      for (const callback of callbacks) await callback();
+    });
+    const tail = task.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.callbackQueues.set(queueKey, tail);
+    void tail.finally(() => {
+      if (this.callbackQueues.get(queueKey) === tail) {
+        this.callbackQueues.delete(queueKey);
+      }
+    });
   }
 
   private async invokeSafely<T>(
@@ -1068,26 +1422,23 @@ export class AcpClient {
     }
   }
 
-  private dispatchAgentRequest(request: JsonRpcRequest): void {
-    const task = this.handleAgentRequest(request);
-    this.agentRequestTasks.add(task);
-    void task
-      .catch((error: unknown) => this.fail(error))
-      .finally(() => this.agentRequestTasks.delete(task));
-  }
-
-  private async handleAgentRequest(request: JsonRpcRequest): Promise<void> {
+  private async handleAgentRequest(
+    request: JsonRpcRequest,
+    pendingPermission?: PendingPermission,
+  ): Promise<void> {
     const customHandler = this.requestHandlers.get(request.method);
     let response: object;
     try {
       let result: unknown;
-      if (customHandler) {
-        result = await customHandler(request.params);
-      } else if (request.method === "session/request_permission") {
+      if (request.method === "session/request_permission") {
         result = await this.handlePermissionRequest(
           request.id,
           request.params as AcpRequestPermissionParams,
+          pendingPermission,
+          customHandler,
         );
+      } else if (customHandler) {
+        result = await customHandler(request.params);
       } else if (request.method === "fs/read_text_file") {
         result = await this.handleReadTextFile(
           request.params as AcpReadTextFileParams,
@@ -1128,28 +1479,108 @@ export class AcpClient {
     await this.writeMessage(response);
   }
 
+  private enqueueAgentRequest(request: JsonRpcRequest): void {
+    const params = isRecord(request.params) ? request.params : undefined;
+    const pendingPermission =
+      request.method === "session/request_permission"
+        ? this.registerPendingPermission(
+            request.id,
+            typeof params?.sessionId === "string" ? params.sessionId : "",
+          )
+        : undefined;
+    const key =
+      typeof params?.sessionId === "string" && params.sessionId.length > 0
+        ? params.sessionId
+        : SESSIONLESS_AGENT_REQUEST_QUEUE;
+    const callbackKey =
+      typeof key === "string" ? key : SESSIONLESS_CALLBACK_QUEUE;
+    const callbackBarrier = this.callbackBarrier(callbackKey);
+    const previous = this.agentRequestQueues.get(key);
+    const task = Promise.all([
+      (previous ?? Promise.resolve()).catch(() => undefined),
+      callbackBarrier,
+    ]).then(
+      async () => await this.handleAgentRequest(request, pendingPermission),
+    );
+    const tail = task.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.agentRequestQueues.set(key, tail);
+    void task.catch((error: unknown) => {
+      if (
+        !this.shutdownRequested &&
+        !this.childExited &&
+        this.state === "running"
+      ) {
+        this.fail(error);
+      }
+    });
+    void tail.finally(() => {
+      if (
+        pendingPermission &&
+        this.pendingPermissions.get(request.id) === pendingPermission
+      ) {
+        this.pendingPermissions.delete(request.id);
+      }
+      if (this.agentRequestQueues.get(key) === tail) {
+        this.agentRequestQueues.delete(key);
+      }
+    });
+  }
+
   private async handlePermissionRequest(
     id: JsonRpcId,
     request: AcpRequestPermissionParams,
+    pendingPermission: PendingPermission | undefined,
+    customHandler: ((params: unknown) => unknown) | undefined,
   ): Promise<AcpRequestPermissionResult> {
-    let cancel!: () => void;
-    const cancelled = new Promise<AcpRequestPermissionResult>((resolve) => {
-      cancel = () => resolve({ outcome: { outcome: "cancelled" } });
-    });
-    this.pendingPermissions.set(id, { sessionId: request.sessionId, cancel });
+    const pending =
+      pendingPermission ??
+      this.registerPendingPermission(id, request.sessionId);
 
     try {
-      const decision = this.onPermissionRequest
-        ? Promise.resolve(this.onPermissionRequest(request)).then((result) =>
-            this.validatePermissionResult(request, result),
-          )
-        : this.permissionMode === "bypassPermissions" || this.alwaysApprove
-          ? Promise.resolve(this.selectAllowOption(request))
-          : Promise.reject(this.defaultPermissionError(request));
-      return await Promise.race([decision, cancelled]);
+      if (pending.cancelled) return await pending.cancellation;
+      const decision = (
+        customHandler
+          ? Promise.resolve(
+              customHandler(request) as AcpRequestPermissionResult,
+            )
+          : this.onPermissionRequest
+            ? Promise.resolve(this.onPermissionRequest(request))
+            : this.permissionMode === "bypassPermissions" || this.alwaysApprove
+              ? Promise.resolve(this.selectAllowOption(request))
+              : Promise.reject<AcpRequestPermissionResult>(
+                  this.defaultPermissionError(request),
+                )
+      ).then((result) => this.validatePermissionResult(request, result));
+      return await Promise.race([decision, pending.cancellation]);
     } finally {
-      this.pendingPermissions.delete(id);
+      if (this.pendingPermissions.get(id) === pending) {
+        this.pendingPermissions.delete(id);
+      }
     }
+  }
+
+  private registerPendingPermission(
+    id: JsonRpcId,
+    sessionId: string,
+  ): PendingPermission {
+    let resolveCancellation!: (result: AcpRequestPermissionResult) => void;
+    const pending: PendingPermission = {
+      sessionId,
+      cancelled: false,
+      cancellation: new Promise((resolve) => {
+        resolveCancellation = resolve;
+      }),
+      cancel: () => {
+        if (pending.cancelled) return;
+        pending.cancelled = true;
+        resolveCancellation({ outcome: { outcome: "cancelled" } });
+      },
+    };
+    this.pendingPermissions.set(id, pending);
+    return pending;
   }
 
   private selectAllowOption(
@@ -1168,16 +1599,31 @@ export class AcpClient {
 
   private validatePermissionResult(
     request: AcpRequestPermissionParams,
-    result: AcpRequestPermissionResult,
+    result: unknown,
   ): AcpRequestPermissionResult {
-    if (result.outcome.outcome === "cancelled") return result;
+    if (!isRecord(result) || !isRecord(result.outcome)) {
+      throw new AcpPermissionError(
+        `Permission callback returned an invalid result. Expected a selected or cancelled outcome. Options: ${this.describePermissionOptions(request)}.`,
+      );
+    }
+    if (result.outcome.outcome === "cancelled") {
+      return result as unknown as AcpRequestPermissionResult;
+    }
+    if (
+      result.outcome.outcome !== "selected" ||
+      typeof result.outcome.optionId !== "string"
+    ) {
+      throw new AcpPermissionError(
+        `Permission callback returned an invalid outcome. Expected a selected option or cancellation. Options: ${this.describePermissionOptions(request)}.`,
+      );
+    }
     const optionId = result.outcome.optionId;
     if (!request.options.some((option) => option.optionId === optionId)) {
       throw new AcpPermissionError(
         `Permission callback selected unknown option '${optionId}'. Options: ${this.describePermissionOptions(request)}.`,
       );
     }
-    return result;
+    return result as unknown as AcpRequestPermissionResult;
   }
 
   private defaultPermissionError(
@@ -1251,16 +1697,66 @@ export class AcpClient {
       this.stderr = this.stderr.slice(-this.stderrLimit);
   }
 
+  private cancelPendingPermissions(sessionId?: string): void {
+    for (const [id, permission] of this.pendingPermissions) {
+      if (sessionId !== undefined && permission.sessionId !== sessionId)
+        continue;
+      this.pendingPermissions.delete(id);
+      permission.cancel();
+    }
+  }
+
+  private isTerminalStdinFailure(error: AcpError): boolean {
+    return TERMINAL_STDIN_FAILURE_CODES.has(error.code ?? "");
+  }
+
+  private async resolveStdinFailure(error: AcpError): Promise<Error> {
+    if (this.shutdownRequested) {
+      return this.lastFailure ?? this.shutdownError ?? error;
+    }
+    if (this.childExited) {
+      return await waitForAcpClientTerminalFailure(this);
+    }
+    if (this.state !== "running") return this.lastFailure ?? error;
+    if (!this.isTerminalStdinFailure(error)) {
+      this.fail(error);
+      return this.lastFailure ?? error;
+    }
+
+    this.provisionalStdinFailure ??= error;
+    if (!this.childExited && !this.provisionalStdinFailureTimer) {
+      this.provisionalStdinFailureTimer = setTimeout(() => {
+        this.provisionalStdinFailureTimer = undefined;
+        if (
+          this.state === "running" &&
+          !this.shutdownRequested &&
+          !this.childExited
+        ) {
+          this.fail(this.provisionalStdinFailure ?? error);
+        }
+      }, TERMINAL_STDIN_FAILURE_GRACE_MS);
+    }
+    return await waitForAcpClientTerminalFailure(this);
+  }
+
+  private clearProvisionalStdinFailureTimer(): void {
+    if (this.provisionalStdinFailureTimer) {
+      clearTimeout(this.provisionalStdinFailureTimer);
+      this.provisionalStdinFailureTimer = undefined;
+    }
+  }
+
   private fail(error: unknown): void {
-    if (this.state === "disposed") return;
+    if (this.state === "disposed" || this.state === "exited") return;
     const resolved =
       error instanceof Error ? error : new AcpError(errorMessage(error));
+    this.clearProvisionalStdinFailureTimer();
     this.lastFailure = resolved;
     this.state = "exited";
+    lifecycleFor(this).resolveTerminalFailure(resolved);
     this.rejectAll(resolved);
-    this.pendingPermissions.forEach((permission) => permission.cancel());
-    this.pendingPermissions.clear();
-    if (!(resolved instanceof AcpSpawnError && resolved.code === "ENOENT")) {
+    this.cancelPendingPermissions();
+    if (!(resolved instanceof AcpSpawnError)) {
       void this.terminateAfterFailure();
     }
   }

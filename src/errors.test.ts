@@ -5,6 +5,7 @@ import {
   AcpAuthenticationError,
   AcpJsonRpcError,
   AcpProcessExitError,
+  AcpProtocolError,
   AcpSpawnError,
 } from "./acp/errors.js";
 import {
@@ -39,29 +40,57 @@ describe("mapAcpError", () => {
     });
   });
 
-  it("preserves authentication-required initialize RPC data", () => {
+  it("maps the ACP authentication-required code to the auth surface", () => {
     const mapped = mapAcpError(
       new AcpJsonRpcError("initialize", {
-        code: -32001,
+        code: -32000,
         message: "Authentication required",
       }),
     );
+    expect(mapped).toBeInstanceOf(LoadAPIKeyError);
+  });
+
+  it("maps bounded token-refresh failures to the auth surface", () => {
+    const mapped = mapAcpError(
+      new AcpJsonRpcError("authenticate", {
+        code: -32603,
+        message: "token refresh failed",
+      }),
+    );
+    expect(mapped).toBeInstanceOf(LoadAPIKeyError);
+  });
+
+  it("keeps transient authenticate service failures retryable", () => {
+    const mapped = mapAcpError(
+      new AcpJsonRpcError("authenticate", {
+        code: -32603,
+        message: "Authentication service unavailable",
+      }),
+    );
     expect(mapped).toBeInstanceOf(APICallError);
-    expect(mapped).toMatchObject({
-      isRetryable: true,
-      data: {
-        code: "JSON_RPC_ERROR",
-        rpcCode: -32001,
-        method: "initialize",
-      },
-    });
+    expect(mapped).not.toBeInstanceOf(LoadAPIKeyError);
+    expect(mapped).toMatchObject({ isRetryable: true });
+  });
+
+  it("does not reinterpret resource-not-found text as authentication", () => {
+    const mapped = mapAcpError(
+      new AcpJsonRpcError("session/load", {
+        code: -32002,
+        message: "API key resource not found",
+      }),
+    );
+    expect(mapped).toBeInstanceOf(APICallError);
+    expect(mapped).not.toBeInstanceOf(LoadAPIKeyError);
+    expect(mapped).toMatchObject({ isRetryable: false });
   });
 
   it.each([
-    { rpcCode: -32001, postDispatch: false, retryable: true },
+    { rpcCode: -32603, postDispatch: false, retryable: true },
+    { rpcCode: -32002, postDispatch: false, retryable: false },
+    { rpcCode: -32800, postDispatch: false, retryable: false },
     { rpcCode: -32700, postDispatch: false, retryable: false },
     { rpcCode: -32601, postDispatch: false, retryable: false },
-    { rpcCode: -32001, postDispatch: true, retryable: false },
+    { rpcCode: -32603, postDispatch: true, retryable: false },
   ])(
     "maps JSON-RPC code $rpcCode with postDispatch=$postDispatch",
     ({ rpcCode, postDispatch, retryable }) => {
@@ -87,6 +116,26 @@ describe("mapAcpError", () => {
     expect(mapped).toMatchObject({
       isRetryable: false,
       data: { code: "PROCESS_EXIT", exitCode: 9, stderr: "agent crashed\n" },
+    });
+  });
+
+  it("keeps malformed process output non-retryable with exit metadata", () => {
+    const mapped = mapAcpError(
+      new AcpProtocolError("Invalid JSON from Grok ACP stdout", {
+        code: "PROTOCOL_ERROR",
+        exitCode: 12,
+        stderr: "parser crash detail\n",
+      }),
+    );
+
+    expect(mapped).toBeInstanceOf(APICallError);
+    expect(mapped).toMatchObject({
+      isRetryable: false,
+      data: {
+        code: "PROTOCOL_ERROR",
+        exitCode: 12,
+        stderr: "parser crash detail\n",
+      },
     });
   });
 
@@ -140,7 +189,7 @@ describe("mapGrokExecError", () => {
     ).toBeInstanceOf(APICallError);
   });
 
-  it("does not infer authentication from process-exit stderr", () => {
+  it("recognizes authentication in process-exit stderr", () => {
     const failure = new GrokCliError("Grok CLI exited with code 7", {
       code: "GROK_CLI_PROCESS_EXIT",
       exitCode: 7,
@@ -148,30 +197,120 @@ describe("mapGrokExecError", () => {
     });
     const mapped = mapGrokExecError(failure, { modelId: "grok-4.6" });
 
-    expect(mapped).toBeInstanceOf(APICallError);
-    expect(mapped).not.toBeInstanceOf(LoadAPIKeyError);
-    expect(mapped).toMatchObject({
-      cause: failure,
-      isRetryable: false,
-      requestBodyValues: { modelId: "grok-4.6" },
-      data: {
-        code: "GROK_CLI_PROCESS_EXIT",
-        exitCode: 7,
-        stderr: "login required: configure API_KEY",
-      },
-    });
+    expect(mapped).toBeInstanceOf(LoadAPIKeyError);
   });
 
-  it("does not infer authentication from headless stderr alone", () => {
+  it("recognizes authentication in headless stderr", () => {
     const mapped = mapGrokExecError(
       new GrokCliError("tool service unavailable", {
         code: "GROK_CLI_HEADLESS_ERROR",
         stderr: "not signed in",
       }),
     );
+    expect(mapped).toBeInstanceOf(LoadAPIKeyError);
+  });
+
+  it.each([
+    "Authentication required",
+    "Login is required",
+    "AuthRequired",
+    "AuthorizationRequired",
+    "Unauthorized",
+    "Unauthenticated",
+    "HTTP 401 unauthorized",
+    "not logged in",
+    "not signed in",
+    "Unauthorized: token expired",
+    "Unauthenticated: please log in",
+    "AuthRequired: run grok login",
+    "missing XAI_API_KEY",
+    "XAI_API_KEY is invalid",
+    "expired api key",
+  ])("recognizes the known authentication diagnostic %s", (diagnostic) => {
+    const mapped = mapGrokExecError(
+      new GrokCliError("Grok CLI exited with code 7", {
+        code: "GROK_CLI_PROCESS_EXIT",
+        exitCode: 7,
+        stderr: diagnostic,
+      }),
+    );
+    expect(mapped).toBeInstanceOf(LoadAPIKeyError);
+  });
+
+  it.each([
+    "2026-07-13T03:48:09Z ERROR Not signed in",
+    "2026-07-13T03:48:09.123456+00:00 [grok::auth] WARN Unauthenticated",
+    "2026-07-13T03:48:09Z ERROR [grok::auth] Not signed in",
+    "[worker-7] FATAL: Authentication required",
+    "DEBUG AuthorizationRequired",
+  ])("normalizes logging prefixes before auth matching: %s", (diagnostic) => {
+    const mapped = mapGrokExecError(
+      new GrokCliError("Grok CLI exited with code 7", {
+        code: "GROK_CLI_PROCESS_EXIT",
+        exitCode: 7,
+        stderr: diagnostic,
+      }),
+    );
+    expect(mapped).toBeInstanceOf(LoadAPIKeyError);
+  });
+
+  it.each([
+    "2026-07-13T03:48:09Z ERROR grok::auth: Login required",
+    "\u001b[31mERROR\u001b[0m grok::auth: Unauthenticated",
+  ])("normalizes logger targets and ANSI colors: %s", (diagnostic) => {
+    const mapped = mapGrokExecError(
+      new GrokCliError("Grok CLI exited with code 7", {
+        code: "GROK_CLI_PROCESS_EXIT",
+        exitCode: 7,
+        stderr: diagnostic,
+      }),
+    );
+    expect(mapped).toBeInstanceOf(LoadAPIKeyError);
+  });
+
+  it.each([
+    "WARN api key missing for optional telemetry",
+    "INFO invalid XAI_API_KEY for optional metrics export",
+    "[WARN] api key missing for optional telemetry",
+    "[INFO] invalid XAI_API_KEY for optional metrics export",
+    "[worker WARN grok::telemetry] missing api key, skipping upload",
+    "telemetry: missing api key, skipping upload",
+  ])("does not promote optional credential diagnostics: %s", (diagnostic) => {
+    const mapped = mapGrokExecError(
+      new GrokCliError("Grok CLI exited with code 7", {
+        code: "GROK_CLI_PROCESS_EXIT",
+        exitCode: 7,
+        stderr: diagnostic,
+      }),
+    );
     expect(mapped).toBeInstanceOf(APICallError);
     expect(mapped).not.toBeInstanceOf(LoadAPIKeyError);
   });
+
+  it.each([
+    "artifact was not signed",
+    "authentication metadata was included in the response",
+    "request field XAI_API_KEY was redacted",
+    "rate limit reached while validating an API key field",
+    "tool could not sign the generated artifact",
+    "2026-07-13T03:48:09Z INFO artifact was not signed",
+  ])(
+    "keeps generic credential-related text as a process failure: %s",
+    (text) => {
+      const mapped = mapGrokExecError(
+        new GrokCliError("Grok CLI exited with code 7", {
+          code: "GROK_CLI_PROCESS_EXIT",
+          exitCode: 7,
+          stderr: text,
+        }),
+      );
+      expect(mapped).toBeInstanceOf(APICallError);
+      expect(mapped).not.toBeInstanceOf(LoadAPIKeyError);
+      expect(mapped).toMatchObject({
+        data: { exitCode: 7, stderr: text },
+      });
+    },
+  );
 
   it("retries only pre-dispatch spawn failures", () => {
     expect(

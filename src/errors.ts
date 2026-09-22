@@ -6,6 +6,8 @@ import {
   AcpProcessExitError,
   AcpSpawnError,
   AcpTimeoutError,
+  isAcpAuthenticationRpcError,
+  stripAnsiEscapeSequences,
 } from "./acp/errors.js";
 
 export interface GrokBuildErrorData {
@@ -45,6 +47,93 @@ export function createGrokBuildAuthenticationError(
   return new LoadAPIKeyError({ message });
 }
 
+const STRONG_AUTHENTICATION_FAILURE_DIAGNOSTICS = [
+  /^(?:error:\s*)?(?:authrequired|authorizationrequired)\b/i,
+  /^(?:error:\s*)?(?:authentication|login)\s+(?:is\s+)?required\b/i,
+  /^(?:error:\s*)?unauthorized\b/i,
+  /^(?:error:\s*)?unauthenticated\b/i,
+  /^(?:error:\s*)?(?:http(?:\s+status)?\s*)?401\b/i,
+  /^(?:error:\s*)?not\s+(?:logged\s+in|signed\s+in)\b/i,
+];
+
+const API_KEY_FAILURE_DIAGNOSTICS = [
+  /^(?:error:\s*)?(?:missing|invalid|expired)\s+(?:xai[_\s-]?)?api[_\s-]?key\b/i,
+  /^(?:error:\s*)?(?:xai[_\s-]?)?api[_\s-]?key\s+(?:is\s+)?(?:missing|invalid|expired)\b/i,
+];
+
+type DiagnosticSeverity =
+  | "TRACE"
+  | "DEBUG"
+  | "INFO"
+  | "WARN"
+  | "ERROR"
+  | "FATAL";
+
+function normalizeAuthenticationDiagnostic(diagnostic: string): {
+  text: string;
+  severity?: DiagnosticSeverity;
+} {
+  let text = stripAnsiEscapeSequences(diagnostic)
+    .trim()
+    .replace(
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})\s+/i,
+      "",
+    )
+    .trim();
+
+  let severity: string | undefined;
+  while (true) {
+    const bracketMatch = /^\[([^\]\r\n]+)\]\s*/.exec(text);
+    if (!bracketMatch) break;
+    const bracketSeverity =
+      /(?:^|[\s:])(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)(?=$|[\s:])/i.exec(
+        bracketMatch[1] ?? "",
+      );
+    severity ??= bracketSeverity?.[1]?.toUpperCase();
+    text = text.slice(bracketMatch[0].length);
+  }
+
+  const unbracketedSeverityMatch =
+    /^(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\b[:\s-]*/i.exec(text);
+  severity ??= unbracketedSeverityMatch?.[1]?.toUpperCase();
+  if (unbracketedSeverityMatch) {
+    text = text.slice(unbracketedSeverityMatch[0].length);
+  }
+  text = text
+    .replace(/^(?:\[[^\]\r\n]+\]\s*)+/, "")
+    .replace(/^[A-Za-z0-9_.-]+(?:::[A-Za-z0-9_.-]+)+:\s*/, "")
+    .trim();
+  return {
+    text,
+    severity:
+      severity === "WARNING"
+        ? "WARN"
+        : (severity as DiagnosticSeverity | undefined),
+  };
+}
+
+function containsAuthenticationFailureDiagnostic(
+  ...sources: string[]
+): boolean {
+  return sources
+    .flatMap((source) => source.split(/[\r\n\u2028\u2029]+|;\s+/))
+    .map(normalizeAuthenticationDiagnostic)
+    .filter(({ text }) => Boolean(text))
+    .some(({ text, severity }) => {
+      if (
+        STRONG_AUTHENTICATION_FAILURE_DIAGNOSTICS.some((pattern) =>
+          pattern.test(text),
+        )
+      ) {
+        return true;
+      }
+      if (severity && severity !== "ERROR" && severity !== "FATAL") {
+        return false;
+      }
+      return API_KEY_FAILURE_DIAGNOSTICS.some((pattern) => pattern.test(text));
+    });
+}
+
 export function mapAcpError(
   error: unknown,
   requestBodyValues?: unknown,
@@ -60,6 +149,9 @@ export function mapAcpError(
     return error;
   }
   if (error instanceof AcpAuthenticationError) {
+    return createGrokBuildAuthenticationError(error.message);
+  }
+  if (isAcpAuthenticationRpcError(error)) {
     return createGrokBuildAuthenticationError(error.message);
   }
 
@@ -83,8 +175,8 @@ export function mapAcpError(
     (error instanceof AcpTimeoutError ||
       error instanceof AcpProcessExitError ||
       (error instanceof AcpJsonRpcError &&
-        error.rpcCode >= -32099 &&
-        error.rpcCode <= -32000));
+        error.rpcCode === -32603 &&
+        !isAcpAuthenticationRpcError(error)));
 
   return new APICallError({
     message:
@@ -113,10 +205,11 @@ export function mapGrokExecError(
   const cliError = error instanceof GrokCliError ? error : undefined;
   const message = error instanceof Error ? error.message : String(error);
   const authenticationFailure =
-    cliError?.code === "GROK_CLI_HEADLESS_ERROR" &&
-    /\b(?:login|unauthorized|authentication|authenticate|authrequired|authorizationrequired)\b|not\s+(?:logged|signed)(?:\s+in)?|api[_\s-]?key|\b401\b/i.test(
-      message,
-    );
+    cliError !== undefined &&
+    ["GROK_CLI_HEADLESS_ERROR", "GROK_CLI_PROCESS_EXIT"].includes(
+      cliError.code,
+    ) &&
+    containsAuthenticationFailureDiagnostic(message, cliError.stderr ?? "");
   if (authenticationFailure) {
     return createGrokBuildAuthenticationError(message);
   }

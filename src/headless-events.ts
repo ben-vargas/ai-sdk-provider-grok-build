@@ -4,6 +4,7 @@ import { GrokCliError } from "./errors.js";
 import type { JsonValue } from "./acp/protocol.js";
 import type { NormalizedEvent } from "./normalized-events.js";
 import { redactSensitiveData } from "./redact.js";
+import { isRecord } from "./type-guards.js";
 
 export interface HeadlessTerminalEvent {
   type: "end";
@@ -13,10 +14,6 @@ export interface HeadlessTerminalEvent {
   usage?: Record<string, unknown>;
   modelUsage?: unknown;
   [key: string]: unknown;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function stringField(
@@ -160,7 +157,13 @@ export class HeadlessEventNormalizer {
       }
       const status = stringField(value, "status");
       if (tracked.finalEmitted) {
-        if (status === "completed" || status === "failed") return events;
+        if (
+          status === undefined ||
+          status === "completed" ||
+          status === "failed"
+        ) {
+          return events;
+        }
         throw new AcpProtocolError(
           `Grok tool update '${id}' arrived after its final result.`,
           { data: raw },

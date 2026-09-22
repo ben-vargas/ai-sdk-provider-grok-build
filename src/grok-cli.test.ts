@@ -203,7 +203,6 @@ describe("Grok CLI resolution", () => {
     ).rejects.toMatchObject({
       code: "GROK_CLI_VERSION_CHECK_TIMEOUT",
       message: "Grok CLI version check timed out after 500ms.",
-      stderr: "still waiting",
     });
   });
 

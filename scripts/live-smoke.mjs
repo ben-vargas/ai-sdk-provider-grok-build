@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -7,6 +7,7 @@ import {
   ensureGrokCliVersion,
   resolveGrokCommand,
 } from "../dist/index.js";
+import { toolInputContainsMarker } from "./live-smoke-input.mjs";
 
 if (process.env.CI) {
   throw new Error(
@@ -77,13 +78,46 @@ try {
   assertHeadlessUsage(execResult.usage);
   console.log("grokExec generation and native usage invariants passed.");
 
-  await exec().doGenerate(
+  const permissionMarker = join(directory, "permission-bypass-marker");
+  const permissionResult = await exec().doGenerate(
     callOptions(
-      "Use the shell tool once to run pwd, then briefly report whether the tool was allowed. Do not ask the user a question.",
+      `Use the shell tool exactly once to run this exact command, then briefly report whether it was allowed. Do not ask the user a question: node -e "require('node:fs').writeFileSync(process.argv[1], 'allowed')" ${JSON.stringify(permissionMarker)}`,
     ),
   );
+  const toolCall = permissionResult.content.find(
+    (part) =>
+      part.type === "tool-call" &&
+      part.providerExecuted === true &&
+      toolInputContainsMarker(part.input, permissionMarker),
+  );
+  if (!toolCall) {
+    throw new Error(
+      "grokExec permission smoke test did not emit the marker-writing tool call.",
+    );
+  }
+  const toolResult = permissionResult.content.find(
+    (part) =>
+      part.type === "tool-result" &&
+      part.toolCallId === toolCall.toolCallId &&
+      part.preliminary !== true,
+  );
+  if (!toolResult || toolResult.isError !== true) {
+    throw new Error(
+      "grokExec permission smoke test did not return a denied final result for the marker-writing tool call.",
+    );
+  }
+  try {
+    await access(permissionMarker);
+    throw new Error(
+      "grokExec permission smoke test allowed the shell command to create its marker.",
+    );
+  } catch (error) {
+    if (!(error && typeof error === "object" && error.code === "ENOENT")) {
+      throw error;
+    }
+  }
   console.log(
-    "grokExec permission-requiring prompt terminated under implicit dontAsk mode.",
+    "grokExec denied the permission-requiring tool under implicit dontAsk mode.",
   );
 
   agent = createGrokAgent({

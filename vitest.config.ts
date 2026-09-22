@@ -4,7 +4,7 @@ export default defineConfig({
   cacheDir: ".cache/vite",
   test: {
     environment: "node",
-    include: ["src/**/*.test.ts"],
+    include: ["src/**/*.test.ts", "scripts/**/*.test.mjs"],
     passWithNoTests: true,
     coverage: {
       provider: "v8",

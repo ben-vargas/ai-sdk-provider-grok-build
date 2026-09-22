@@ -46,14 +46,22 @@ export {
   type ReasoningEffort,
 } from "./settings.js";
 export type {
+  AcpConfigBooleanOption,
   AcpConfigOption,
+  AcpConfigOptionBase,
   AcpConfigSelectChoice,
+  AcpConfigSelectGroup,
+  AcpConfigSelectOption,
+  AcpConfigUnknownOption,
   AcpHttpMcpServer,
+  AcpLoadSessionResult,
   AcpMcpServer,
   AcpSseMcpServer,
   AcpStdioMcpServer,
   AcpSetConfigOptionParams,
   AcpSetConfigOptionResult,
+  AcpSessionResult,
+  AcpSessionState,
 } from "./acp/protocol.js";
 export {
   AcpClient,

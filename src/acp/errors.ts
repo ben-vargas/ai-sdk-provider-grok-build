@@ -13,9 +13,12 @@ const ANSI_ESCAPE_SEQUENCE =
   // eslint-disable-next-line no-control-regex
   /\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~])/g;
 
+export function stripAnsiEscapeSequences(raw: string): string {
+  return raw.replace(ANSI_ESCAPE_SEQUENCE, "");
+}
+
 export function stderrTail(raw: string): string {
-  const lines = raw
-    .replace(ANSI_ESCAPE_SEQUENCE, "")
+  const lines = stripAnsiEscapeSequences(raw)
     .split(/\r\n|\r|\n|\u2028|\u2029/)
     .map((line) =>
       Array.from(line)
@@ -79,6 +82,7 @@ export class AcpProtocolError extends AcpError {
 
 export class AcpJsonRpcError extends AcpProtocolError {
   readonly rpcCode: number;
+  readonly rpcMessage: string;
   readonly method: string;
 
   constructor(
@@ -93,8 +97,24 @@ export class AcpJsonRpcError extends AcpProtocolError {
     });
     this.name = "AcpJsonRpcError";
     this.rpcCode = error.code;
+    this.rpcMessage = error.message;
     this.method = method;
   }
+}
+
+const AUTHENTICATION_RPC_DIAGNOSTIC =
+  /\b(?:token|credential)\s+refresh\s+failed\b|\b(?:authentication|login)\s+(?:is\s+)?required\b|\bunauthorized\b|\bunauthenticated\b|\b(?:invalid|expired)\s+(?:access\s+)?token\b/i;
+
+/** @internal Classify only explicit ACP authentication failures. */
+export function isAcpAuthenticationRpcError(
+  error: unknown,
+): error is AcpJsonRpcError {
+  return (
+    error instanceof AcpJsonRpcError &&
+    (error.rpcCode === -32000 ||
+      (error.rpcCode === -32603 &&
+        AUTHENTICATION_RPC_DIAGNOSTIC.test(error.rpcMessage)))
+  );
 }
 
 export class AcpTimeoutError extends AcpError {

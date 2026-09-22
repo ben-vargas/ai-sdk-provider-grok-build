@@ -1,9 +1,9 @@
 import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
-import { PassThrough } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { AcpClient, NdjsonFramer, type AcpChildProcess } from "./client.js";
-import { AcpSpawnError } from "./errors.js";
+import { AcpProtocolError, AcpSpawnError } from "./errors.js";
 import type {
   AcpSessionUpdateParams,
   AcpMessageChunkUpdate,
@@ -163,6 +163,52 @@ class StubbornChild extends FixtureChild {
   }
 }
 
+class CustomStdinChild extends EventEmitter implements AcpChildProcess {
+  readonly stdout = new PassThrough();
+  readonly stderr = new PassThrough();
+  readonly killSignals: Array<NodeJS.Signals | number | undefined> = [];
+  private exited = false;
+
+  constructor(readonly stdin: Writable) {
+    super();
+  }
+
+  kill(signal?: NodeJS.Signals | number): boolean {
+    this.killSignals.push(signal);
+    if (!this.exited) {
+      this.exited = true;
+      this.stdout.end();
+      this.stderr.end();
+      queueMicrotask(() =>
+        this.emit("exit", null, typeof signal === "string" ? signal : null),
+      );
+    }
+    return true;
+  }
+}
+
+class RunningFixtureChild extends FixtureChild {
+  readonly pid = 12_345;
+}
+
+function initializeResult(extra: Record<string, unknown> = {}) {
+  return {
+    protocolVersion: 1,
+    agentCapabilities: {
+      loadSession: true,
+      promptCapabilities: {
+        image: false,
+        audio: false,
+        embeddedContext: true,
+      },
+      mcpCapabilities: { http: true, sse: true },
+      sessionCapabilities: {},
+    },
+    authMethods: [],
+    ...extra,
+  };
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -214,7 +260,7 @@ describe("AcpClient fixture replay", () => {
     child.send({
       jsonrpc: "2.0",
       id: firstSession.id,
-      error: { code: -32001, message: "Authentication required" },
+      error: { code: -32000, message: "Authentication required" },
     });
     await new Promise((resolve) => setImmediate(resolve));
     const sessionRequests = child.requests.filter(
@@ -683,6 +729,50 @@ describe("AcpClient fixture replay", () => {
     await client.dispose();
   });
 
+  it("sends boolean session configuration values", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/set_config_option",
+    ]);
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    const pending = client.setConfigOption({
+      sessionId: "session-boolean",
+      configId: "streaming",
+      type: "boolean",
+      value: false,
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    const request = child.requests.find(
+      (message) =>
+        "method" in message && message.method === "session/set_config_option",
+    ) as JsonRpcRequest;
+    expect(request.params).toEqual({
+      sessionId: "session-boolean",
+      configId: "streaming",
+      type: "boolean",
+      value: false,
+    });
+    child.send({
+      jsonrpc: "2.0",
+      id: request.id,
+      result: {
+        configOptions: [
+          {
+            id: "streaming",
+            name: "Streaming",
+            type: "boolean",
+            currentValue: false,
+          },
+        ],
+      },
+    });
+    await expect(pending).resolves.toMatchObject({
+      configOptions: [
+        { id: "streaming", type: "boolean", currentValue: false },
+      ],
+    });
+    await client.dispose();
+  });
+
   it("keeps a client non-idle until its generation lease is released", () => {
     const client = new AcpClient();
     const release = client.acquireLease();
@@ -771,6 +861,138 @@ describe("AcpClient fixture replay", () => {
     },
   );
 
+  it.each(["session/new", "session/load"] as const)(
+    "keeps abort active while %s waits for extension callbacks",
+    async (method) => {
+      let releaseExtension!: () => void;
+      const extensionReleased = new Promise<void>((resolve) => {
+        releaseExtension = resolve;
+      });
+      let extensionStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        extensionStarted = resolve;
+      });
+      const child = new FixtureChild(readFixture("text-only.jsonl"), [method]);
+      const client = new AcpClient({
+        authMethod: false,
+        spawn: () => child,
+        onExtension: async () => {
+          extensionStarted();
+          await extensionReleased;
+        },
+      });
+      await client.initialize();
+      const controller = new AbortController();
+      const pending =
+        method === "session/new"
+          ? client.newSession(
+              { cwd: "/fixture", mcpServers: [] },
+              controller.signal,
+            )
+          : client.loadSession(
+              {
+                sessionId: "existing-session",
+                cwd: "/fixture",
+                mcpServers: [],
+              },
+              controller.signal,
+            );
+      const rejection = expect(pending).rejects.toMatchObject({
+        name: "AbortError",
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      const request = child.requests.find(
+        (message) => "method" in message && message.method === method,
+      ) as JsonRpcRequest;
+      child.send({
+        jsonrpc: "2.0",
+        method: "_x.ai/session_notification",
+        params:
+          method === "session/load" ? { sessionId: "existing-session" } : {},
+      });
+      child.send({
+        jsonrpc: "2.0",
+        id: request.id,
+        result:
+          method === "session/new"
+            ? { sessionId: "new-session" }
+            : { configOptions: [] },
+      });
+
+      await started;
+      await new Promise((resolve) => setImmediate(resolve));
+      controller.abort();
+      await rejection;
+      releaseExtension();
+      await client.dispose();
+    },
+  );
+
+  it("waits for both sessionless and returned-session callbacks on session/new", async () => {
+    let releaseSessionless!: () => void;
+    const sessionlessReleased = new Promise<void>((resolve) => {
+      releaseSessionless = resolve;
+    });
+    let releaseSession!: () => void;
+    const sessionReleased = new Promise<void>((resolve) => {
+      releaseSession = resolve;
+    });
+    const started = new Set<string>();
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/new",
+    ]);
+    const client = new AcpClient({
+      authMethod: false,
+      spawn: () => child,
+      onExtension: async ({ params }) => {
+        const key =
+          isRecord(params) && typeof params.sessionId === "string"
+            ? params.sessionId
+            : "sessionless";
+        started.add(key);
+        await (key === "new-session" ? sessionReleased : sessionlessReleased);
+      },
+    });
+    await client.initialize();
+    const pending = client.newSession({ cwd: "/fixture", mcpServers: [] });
+    await new Promise((resolve) => setImmediate(resolve));
+    const request = child.requests.find(
+      (message) =>
+        "method" in message &&
+        message.method === "session/new" &&
+        "id" in message,
+    ) as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      method: "_x.ai/settings/update",
+      params: {},
+    });
+    child.send({
+      jsonrpc: "2.0",
+      method: "_x.ai/session_notification",
+      params: { sessionId: "new-session" },
+    });
+    child.send({
+      jsonrpc: "2.0",
+      id: request.id,
+      result: { sessionId: "new-session" },
+    });
+
+    await vi.waitFor(() =>
+      expect(started).toEqual(new Set(["sessionless", "new-session"])),
+    );
+    let settled = false;
+    void pending.finally(() => {
+      settled = true;
+    });
+    releaseSessionless();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+    releaseSession();
+    await expect(pending).resolves.toMatchObject({ sessionId: "new-session" });
+    await client.dispose();
+  });
+
   it("propagates abort through lazy authentication without retrying the session", async () => {
     const child = new FixtureChild(readFixture("text-only.jsonl"), [
       "session/new",
@@ -789,7 +1011,7 @@ describe("AcpClient fixture replay", () => {
     child.send({
       jsonrpc: "2.0",
       id: session.id,
-      error: { code: -32001, message: "Authentication required" },
+      error: { code: -32000, message: "Authentication required" },
     });
     await new Promise((resolve) => setImmediate(resolve));
     controller.abort();
@@ -839,6 +1061,7 @@ describe("AcpClient failures", () => {
     const cause = Object.assign(new Error("spawn /missing/grok ENOENT"), {
       code: "ENOENT",
       path: "/missing/grok",
+      syscall: "spawn /missing/grok",
     });
     child.failToSpawn(cause);
 
@@ -850,7 +1073,37 @@ describe("AcpClient failures", () => {
     expect(client.failure?.message).toContain(
       "Could not find Grok Build executable '/missing/grok'",
     );
+    child.stdin.destroy();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(client.failure).toBeInstanceOf(AcpSpawnError);
+    await expect(client.dispose()).resolves.toBeUndefined();
   });
+
+  it.each(["EAGAIN", "EPERM", "EMFILE"])(
+    "classifies pre-start %s from a PID-less child as a spawn failure",
+    async (code) => {
+      const stdin = new Writable({
+        write() {
+          // Keep the initial write pending so no startup evidence is recorded.
+        },
+      });
+      const child = new CustomStdinChild(stdin);
+      const client = new AcpClient({ spawn: () => child });
+      const pending = client.initialize();
+      const cause = Object.assign(new Error(`spawn failed with ${code}`), {
+        code,
+      });
+      child.emit("error", cause);
+
+      await expect(pending).rejects.toMatchObject({
+        name: "AcpSpawnError",
+        code,
+        cause,
+      });
+      expect(child.killSignals).toEqual([]);
+      await client.dispose();
+    },
+  );
 
   it("fails initialization on a malformed JSON line", async () => {
     const child = new FixtureChild(readFixture("text-only.jsonl"), [
@@ -871,6 +1124,708 @@ describe("AcpClient failures", () => {
     expect(child.killSignals).toContain("SIGTERM");
   });
 
+  it("rejects EPIPE writes without emitting an unhandled stream error", async () => {
+    const pipeError = Object.assign(new Error("write EPIPE"), {
+      code: "EPIPE",
+    });
+    const stdin = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback(pipeError);
+      },
+    });
+    const child = new CustomStdinChild(stdin);
+    const client = new AcpClient({ spawn: () => child });
+
+    await expect(client.initialize()).rejects.toMatchObject({ code: "EPIPE" });
+    expect(client.isUsable).toBe(false);
+    await client.dispose();
+  });
+
+  it("prefers process-exit context when EPIPE is followed by child exit", async () => {
+    const pipeError = Object.assign(new Error("write EPIPE"), {
+      code: "EPIPE",
+    });
+    const stdin = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback(pipeError);
+      },
+    });
+    const child = new CustomStdinChild(stdin);
+    const client = new AcpClient({ spawn: () => child });
+    const pending = client.initialize();
+    await new Promise((resolve) => setImmediate(resolve));
+    child.emit("exit", 9, null);
+    child.stdout.end();
+    child.stderr.end("complete crash output\n");
+
+    await expect(pending).rejects.toMatchObject({
+      name: "AcpProcessExitError",
+      code: "PROCESS_EXIT",
+      exitCode: 9,
+      stderr: "complete crash output\n",
+    });
+    expect(client.failure).toMatchObject({ code: "PROCESS_EXIT" });
+  });
+
+  it("keeps terminal stdin diagnosis independent from terminate grace", async () => {
+    vi.useFakeTimers();
+    try {
+      const pipeError = Object.assign(new Error("write EPIPE"), {
+        code: "EPIPE",
+      });
+      const stdin = new Writable({
+        write(_chunk, _encoding, callback) {
+          callback(pipeError);
+        },
+      });
+      const child = new CustomStdinChild(stdin);
+      const client = new AcpClient({
+        terminateGraceMs: 0,
+        spawn: () => child,
+      });
+      const pending = client.initialize();
+      let settled = false;
+      void pending.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(client.isUsable).toBe(false);
+      expect(settled).toBe(false);
+
+      child.emit("exit", 9, null);
+      child.stdout.end();
+      child.stderr.end("complete crash output\n");
+
+      await expect(pending).rejects.toMatchObject({
+        name: "AcpProcessExitError",
+        code: "PROCESS_EXIT",
+        exitCode: 9,
+        stderr: "complete crash output\n",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["EOF", "ENOTCONN", "ECONNABORTED", "ECANCELED"])(
+    "defers terminal stdin error %s to process-exit details",
+    async (code) => {
+      const stdinError = Object.assign(new Error(`write ${code}`), { code });
+      const stdin = new Writable({
+        write(_chunk, _encoding, callback) {
+          callback(stdinError);
+        },
+      });
+      const child = new CustomStdinChild(stdin);
+      const client = new AcpClient({ spawn: () => child });
+      const pending = client.initialize();
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(client.isUsable).toBe(false);
+      child.emit("exit", 11, null);
+      child.stdout.end();
+      child.stderr.end(`${code} crash detail\n`);
+
+      await expect(pending).rejects.toMatchObject({
+        name: "AcpProcessExitError",
+        code: "PROCESS_EXIT",
+        exitCode: 11,
+        stderr: `${code} crash detail\n`,
+      });
+    },
+  );
+
+  it("waits for terminal diagnostics when reused during provisional EPIPE", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"));
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    await client.initialize();
+    vi.spyOn(child.stdin, "write").mockImplementationOnce(() => {
+      throw Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+    });
+    const failedWrite = client.notify("session/cancel", {
+      sessionId: "session-terminal",
+    });
+    const writeRejection = expect(failedWrite).rejects.toMatchObject({
+      name: "AcpProcessExitError",
+      exitCode: 14,
+      stderr: "terminal crash detail\n",
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(client.isUsable).toBe(false);
+
+    const release = client.acquireLease();
+    const reinitialize = client.initialize();
+    const initializeRejection = expect(reinitialize).rejects.toMatchObject({
+      name: "AcpProcessExitError",
+      exitCode: 14,
+      stderr: "terminal crash detail\n",
+    });
+    child.failWithStderr("terminal crash detail\n", 14);
+
+    await Promise.all([writeRejection, initializeRejection]);
+    release();
+    await client.dispose();
+  });
+
+  it("unblocks disposal when EPIPE occurs during the terminal-failure grace window", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = new StubbornChild(readFixture("text-only.jsonl"), [
+        "session/prompt",
+      ]);
+      const client = new AcpClient({ authMethod: false, spawn: () => child });
+      const session = await client.newSession({
+        cwd: "/fixture",
+        mcpServers: [],
+      });
+      vi.spyOn(child.stdin, "write").mockImplementationOnce(() => {
+        throw Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+      });
+      const prompt = client.prompt({
+        sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "wait" }],
+      });
+      const promptRejection = expect(prompt).rejects.toMatchObject({
+        code: "CLIENT_DISPOSED",
+      });
+      await vi.advanceTimersByTimeAsync(0);
+
+      const disposal = client.dispose();
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      await expect(disposal).resolves.toBeUndefined();
+      await promptRejection;
+      expect(child.requests).toContainEqual({
+        jsonrpc: "2.0",
+        method: "session/cancel",
+        params: { sessionId: session.sessionId },
+      });
+      expect(child.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ignores stdin errors emitted after the child exit event", async () => {
+    const stdin = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
+    const child = new CustomStdinChild(stdin);
+    const client = new AcpClient({ spawn: () => child });
+    const pending = client.initialize();
+    await new Promise((resolve) => setImmediate(resolve));
+    child.emit("exit", 4, null);
+    stdin.emit(
+      "error",
+      Object.assign(new Error("late EPIPE"), { code: "EPIPE" }),
+    );
+    child.stdout.end();
+    child.stderr.end("exit detail\n");
+
+    await expect(pending).rejects.toMatchObject({
+      name: "AcpProcessExitError",
+      exitCode: 4,
+      stderr: "exit detail\n",
+    });
+    expect(client.failure).toMatchObject({ code: "PROCESS_EXIT" });
+  });
+
+  it("keeps process-exit context when a pending write reports late EIO", async () => {
+    let finishWrite!: (error?: Error | null) => void;
+    const stdin = new Writable({
+      write(_chunk, _encoding, callback) {
+        finishWrite = callback;
+      },
+    });
+    const child = new CustomStdinChild(stdin);
+    const client = new AcpClient({ spawn: () => child });
+    const pending = client.initialize();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    child.emit("exit", 13, null);
+    finishWrite(Object.assign(new Error("late write EIO"), { code: "EIO" }));
+    child.stdout.end();
+    child.stderr.end("late write crash detail\n");
+
+    await expect(pending).rejects.toMatchObject({
+      name: "AcpProcessExitError",
+      code: "PROCESS_EXIT",
+      exitCode: 13,
+      stderr: "late write crash detail\n",
+    });
+    expect(client.failure).toMatchObject({ code: "PROCESS_EXIT" });
+  });
+
+  it("rejects writes immediately when stdin is already destroyed", async () => {
+    const stdin = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
+    stdin.destroy();
+    const child = new CustomStdinChild(stdin);
+    const client = new AcpClient({ spawn: () => child });
+
+    await expect(client.initialize()).rejects.toMatchObject({
+      code: "STDIN_NOT_WRITABLE",
+    });
+    expect(client.isUsable).toBe(false);
+    await client.dispose();
+  });
+
+  it.each([
+    ["EIO", "EIO"],
+    ["EBADF", "EBADF"],
+    [undefined, "STDIN_WRITE_FAILED"],
+  ])(
+    "treats an unlisted stdin error code %s as a fatal client failure",
+    async (code, expectedCode) => {
+      const child = new FixtureChild(readFixture("text-only.jsonl"));
+      const client = new AcpClient({ authMethod: false, spawn: () => child });
+      await client.initialize();
+      vi.spyOn(child.stdin, "write").mockImplementationOnce(() => {
+        throw Object.assign(new Error("fatal write failure"), { code });
+      });
+
+      await expect(
+        client.notify("session/cancel", { sessionId: "fatal" }),
+      ).rejects.toMatchObject({ code: expectedCode });
+      expect(client.isUsable).toBe(false);
+      await vi.waitFor(() => expect(child.killSignals).toContain("SIGTERM"));
+      await client.dispose();
+    },
+  );
+
+  it("treats an error event from a running child as a runtime failure", async () => {
+    const child = new RunningFixtureChild(readFixture("text-only.jsonl"), [
+      "initialize",
+    ]);
+    const client = new AcpClient({ spawn: () => child });
+    const pending = client.initialize();
+    await new Promise((resolve) => setImmediate(resolve));
+    const cause = Object.assign(new Error("runtime process error"), {
+      code: "EIO",
+    });
+    child.emit("error", cause);
+
+    await expect(pending).rejects.toMatchObject({
+      name: "AcpError",
+      code: "EIO",
+      cause,
+    });
+    expect(client.failure).not.toBeInstanceOf(AcpSpawnError);
+    await vi.waitFor(() => expect(child.killSignals).toContain("SIGTERM"));
+    await client.dispose();
+  });
+
+  it.each(["EIO", "ENOENT"])(
+    "treats %s from a started PID-less custom child as a runtime failure",
+    async (code) => {
+      const child = new FixtureChild(readFixture("text-only.jsonl"), [
+        "initialize",
+      ]);
+      const client = new AcpClient({ spawn: () => child });
+      const pending = client.initialize();
+      await new Promise((resolve) => setImmediate(resolve));
+      const cause = Object.assign(new Error("runtime process error"), { code });
+
+      child.emit("error", cause);
+
+      await expect(pending).rejects.toMatchObject({
+        name: "AcpError",
+        code,
+        cause,
+      });
+      expect(client.failure).not.toBeInstanceOf(AcpSpawnError);
+      await vi.waitFor(() => expect(child.killSignals).toContain("SIGTERM"));
+      await client.dispose();
+    },
+  );
+
+  it("handles a missing runtime child error payload", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "initialize",
+    ]);
+    const client = new AcpClient({ spawn: () => child });
+    const pending = client.initialize();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    child.emit("error");
+
+    await expect(pending).rejects.toMatchObject({
+      name: "AcpError",
+      code: "PROCESS_ERROR",
+    });
+    await vi.waitFor(() => expect(child.killSignals).toContain("SIGTERM"));
+    await client.dispose();
+  });
+
+  it("does not turn an authentication-retry timeout into a login error", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = new FixtureChild(readFixture("text-only.jsonl"), [
+        "session/new",
+        "authenticate",
+      ]);
+      const client = new AcpClient({
+        requestTimeoutMs: 25,
+        spawn: () => child,
+      });
+      const pending = client.newSession({ cwd: "/fixture", mcpServers: [] });
+      const rejection = expect(pending).rejects.toMatchObject({
+        name: "AcpTimeoutError",
+        code: "TIMEOUT",
+        method: "authenticate",
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      const sessionRequest = child.requests.find(
+        (message) => "method" in message && message.method === "session/new",
+      ) as JsonRpcRequest;
+      child.send({
+        jsonrpc: "2.0",
+        id: sessionRequest.id,
+        error: { code: -32000, message: "Authentication required" },
+      });
+      await vi.advanceTimersByTimeAsync(25);
+
+      await rejection;
+      await client.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("wraps an authentication JSON-RPC failure as a login error", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "authenticate",
+    ]);
+    const client = new AcpClient({ spawn: () => child });
+    const pending = client.authenticate();
+    await new Promise((resolve) => setImmediate(resolve));
+    const request = child.requests.find(
+      (message) => "method" in message && message.method === "authenticate",
+    ) as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      id: request.id,
+      error: { code: -32000, message: "Authentication required" },
+    });
+
+    await expect(pending).rejects.toMatchObject({
+      name: "AcpAuthenticationError",
+      code: "AUTHENTICATION_FAILED",
+      cause: {
+        name: "AcpJsonRpcError",
+        code: "JSON_RPC_ERROR",
+        method: "authenticate",
+      },
+    });
+    await client.dispose();
+  });
+
+  it("preserves transient JSON-RPC errors from authenticate", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "authenticate",
+    ]);
+    const client = new AcpClient({ spawn: () => child });
+    const pending = client.authenticate();
+    await new Promise((resolve) => setImmediate(resolve));
+    const request = child.requests.find(
+      (message) => "method" in message && message.method === "authenticate",
+    ) as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      id: request.id,
+      error: { code: -32603, message: "Authentication service unavailable" },
+    });
+
+    await expect(pending).rejects.toMatchObject({
+      name: "AcpJsonRpcError",
+      code: "JSON_RPC_ERROR",
+      rpcCode: -32603,
+      method: "authenticate",
+    });
+    await client.dispose();
+  });
+
+  it("wraps token-refresh failures from authenticate as login errors", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "authenticate",
+    ]);
+    const client = new AcpClient({ spawn: () => child });
+    const pending = client.authenticate();
+    await new Promise((resolve) => setImmediate(resolve));
+    const request = child.requests.find(
+      (message) => "method" in message && message.method === "authenticate",
+    ) as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      id: request.id,
+      error: { code: -32603, message: "token refresh failed" },
+    });
+
+    await expect(pending).rejects.toMatchObject({
+      name: "AcpAuthenticationError",
+      code: "AUTHENTICATION_FAILED",
+      cause: { rpcCode: -32603, rpcMessage: "token refresh failed" },
+    });
+    await client.dispose();
+  });
+
+  it("does not turn a process exit during authentication retry into a login error", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/new",
+      "authenticate",
+    ]);
+    const client = new AcpClient({ spawn: () => child });
+    const pending = client.newSession({ cwd: "/fixture", mcpServers: [] });
+    await new Promise((resolve) => setImmediate(resolve));
+    const sessionRequest = child.requests.find(
+      (message) => "method" in message && message.method === "session/new",
+    ) as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      id: sessionRequest.id,
+      error: { code: -32000, message: "Authentication required" },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    child.failWithStderr("authentication worker crashed\n", 17);
+
+    await expect(pending).rejects.toMatchObject({
+      name: "AcpProcessExitError",
+      code: "PROCESS_EXIT",
+      exitCode: 17,
+    });
+    expect(client.failure?.name).not.toBe("AcpAuthenticationError");
+  });
+
+  it("does not turn disposal during authentication retry into a login error", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/new",
+      "authenticate",
+    ]);
+    const client = new AcpClient({ spawn: () => child });
+    const pending = client.newSession({ cwd: "/fixture", mcpServers: [] });
+    const rejection = expect(pending).rejects.toMatchObject({
+      name: "AcpError",
+      code: "CLIENT_DISPOSED",
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    const sessionRequest = child.requests.find(
+      (message) => "method" in message && message.method === "session/new",
+    ) as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      id: sessionRequest.id,
+      error: { code: -32000, message: "Authentication required" },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    await client.dispose();
+    await rejection;
+  });
+
+  it("normalizes nullable initialize model state before caching it", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "initialize",
+    ]);
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    const pending = client.initialize();
+    await new Promise((resolve) => setImmediate(resolve));
+    const request = child.requests[0] as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      id: request.id,
+      result: initializeResult({ _meta: { modelState: null } }),
+    });
+
+    const initialized = await pending;
+    expect(initialized._meta).not.toHaveProperty("modelState");
+    expect(await client.initialize()).toBe(initialized);
+    await client.dispose();
+  });
+
+  it("rejects malformed initialize model metadata with redacted data", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "initialize",
+    ]);
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    const pending = client.initialize();
+    await new Promise((resolve) => setImmediate(resolve));
+    const request = child.requests[0] as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      id: request.id,
+      result: initializeResult({
+        _meta: {
+          modelState: {
+            currentModelId: "grok-4.5",
+            availableModels: [
+              {
+                modelId: "grok-4.5",
+                name: "Grok 4.5",
+                apiKey: "wire-secret",
+                _meta: { reasoningEfforts: { invalid: true } },
+              },
+            ],
+          },
+        },
+      }),
+    });
+
+    const error = await pending.catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(AcpProtocolError);
+    expect(JSON.stringify((error as AcpProtocolError).data)).not.toContain(
+      "wire-secret",
+    );
+    expect(JSON.stringify((error as AcpProtocolError).data)).toContain(
+      "[REDACTED]",
+    );
+    expect(client.isUsable).toBe(false);
+    await client.dispose();
+  });
+
+  it("validates and preserves grouped, boolean, and future config options", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/new",
+    ]);
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    const pending = client.newSession({ cwd: "/fixture", mcpServers: [] });
+    await new Promise((resolve) => setImmediate(resolve));
+    const request = child.requests.find(
+      (message) => "method" in message && message.method === "session/new",
+    ) as JsonRpcRequest;
+    const configOptions = [
+      {
+        id: "model",
+        name: "Model",
+        type: "select",
+        currentValue: "grok-4.5",
+        options: [
+          {
+            group: "grok",
+            name: "Grok",
+            options: [{ value: "grok-4.5", name: "Grok 4.5" }],
+          },
+        ],
+      },
+      {
+        id: "streaming",
+        name: "Streaming",
+        type: "boolean",
+        currentValue: true,
+      },
+      {
+        id: "future-option",
+        name: "Future option",
+        type: "range",
+        currentValue: 3,
+        bounds: { minimum: 1, maximum: 5 },
+      },
+    ];
+    child.send({
+      jsonrpc: "2.0",
+      id: request.id,
+      result: { sessionId: "session-config", configOptions },
+    });
+
+    await expect(pending).resolves.toMatchObject({ configOptions });
+    await client.dispose();
+  });
+
+  it("keeps malformed session responses local to their request", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/new",
+    ]);
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    const malformed = client.newSession({ cwd: "/fixture", mcpServers: [] });
+    await new Promise((resolve) => setImmediate(resolve));
+    const first = child.requests.find(
+      (message) => "method" in message && message.method === "session/new",
+    ) as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      id: first.id,
+      result: {
+        sessionId: "bad-session",
+        configOptions: [
+          {
+            id: "model",
+            name: "Model",
+            type: "select",
+            currentValue: "grok-4.5",
+            options: [{ value: "grok-4.5" }],
+          },
+        ],
+      },
+    });
+    await expect(malformed).rejects.toBeInstanceOf(AcpProtocolError);
+    expect(client.isUsable).toBe(true);
+
+    const healthy = client.newSession({ cwd: "/fixture", mcpServers: [] });
+    await new Promise((resolve) => setImmediate(resolve));
+    const requests = child.requests.filter(
+      (message) => "method" in message && message.method === "session/new",
+    ) as JsonRpcRequest[];
+    child.send({
+      jsonrpc: "2.0",
+      id: requests[1]?.id,
+      result: { sessionId: "healthy-session" },
+    });
+    await expect(healthy).resolves.toMatchObject({
+      sessionId: "healthy-session",
+    });
+    await client.dispose();
+  });
+
+  it("normalizes null authentication results while rejecting null prompts", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "authenticate",
+      "session/prompt",
+    ]);
+    const client = new AcpClient({ spawn: () => child });
+    const authentication = client.authenticate();
+    await new Promise((resolve) => setImmediate(resolve));
+    const authenticateRequest = child.requests.find(
+      (message) => "method" in message && message.method === "authenticate",
+    ) as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      id: authenticateRequest.id,
+      result: null,
+    });
+    await expect(authentication).resolves.toEqual({});
+
+    const session = await client.newSession({
+      cwd: "/fixture",
+      mcpServers: [],
+    });
+    const prompt = client.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "test" }],
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    const promptRequest = child.requests.find(
+      (message) => "method" in message && message.method === "session/prompt",
+    ) as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      id: promptRequest.id,
+      result: null,
+    });
+    await expect(prompt).rejects.toBeInstanceOf(AcpProtocolError);
+    expect(client.isUsable).toBe(true);
+    await client.dispose();
+  });
+
   it("includes stderr when the agent exits before emitting any stdout", async () => {
     const child = new FixtureChild(readFixture("text-only.jsonl"), [
       "initialize",
@@ -889,6 +1844,42 @@ describe("AcpClient failures", () => {
     expect(client.failure?.message).toContain(
       "Stderr tail: login required on stderr only",
     );
+  });
+
+  it("bounds process-exit reporting when stderr remains open", async () => {
+    vi.useFakeTimers();
+    try {
+      const stdin = new Writable({
+        write(_chunk, _encoding, callback) {
+          callback();
+        },
+      });
+      const child = new CustomStdinChild(stdin);
+      const client = new AcpClient({
+        authMethod: false,
+        requestTimeoutMs: 10_000,
+        terminateGraceMs: 0,
+        spawn: () => child,
+      });
+      const pending = client.initialize();
+      const rejection = expect(pending).rejects.toMatchObject({
+        name: "AcpProcessExitError",
+        code: "PROCESS_EXIT",
+        exitCode: 6,
+        stderr: "inherited stderr still open\n",
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      child.stderr.write("inherited stderr still open\n");
+      child.emit("exit", 6, null);
+      child.stdout.end();
+
+      await vi.advanceTimersByTimeAsync(500);
+
+      await rejection;
+      child.stderr.end();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("rejects an in-flight prompt when the agent exits mid-prompt", async () => {
@@ -941,8 +1932,159 @@ describe("AcpClient failures", () => {
     });
     child.emit("exit", 0, null);
     child.stdout.end();
+    child.stderr.end();
 
     await expect(pending).resolves.toMatchObject({ stopReason: "end_turn" });
+  });
+
+  it("keeps process failure authoritative while a response awaits callbacks", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/prompt",
+    ]);
+    let releaseUpdate!: () => void;
+    const updateReleased = new Promise<void>((resolve) => {
+      releaseUpdate = resolve;
+    });
+    let updateStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      updateStarted = resolve;
+    });
+    const client = new AcpClient({
+      authMethod: false,
+      terminateGraceMs: 0,
+      spawn: () => child,
+      onUpdate: async () => {
+        updateStarted();
+        await updateReleased;
+      },
+    });
+    const session = await client.newSession({
+      cwd: "/fixture",
+      mcpServers: [],
+    });
+    const prompt = client.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "wait" }],
+    });
+    const rejection = expect(prompt).rejects.toMatchObject({
+      name: "AcpProcessExitError",
+      code: "PROCESS_EXIT",
+      exitCode: 0,
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    const request = child.requests.find(
+      (message) =>
+        "method" in message &&
+        message.method === "session/prompt" &&
+        "id" in message,
+    ) as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: session.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "done" },
+        },
+      },
+    });
+    child.send({
+      jsonrpc: "2.0",
+      id: request.id,
+      result: { stopReason: "end_turn" },
+    });
+    child.emit("exit", 0, null);
+    child.stdout.end();
+    child.stderr.end();
+
+    await started;
+    let settled = false;
+    void prompt.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(settled).toBe(true);
+    expect(client.failure).toMatchObject({ code: "PROCESS_EXIT", exitCode: 0 });
+
+    await rejection;
+    releaseUpdate();
+  });
+
+  it("keeps malformed buffered output authoritative over process exit", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "initialize",
+    ]);
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    const pending = client.initialize();
+    await new Promise((resolve) => setImmediate(resolve));
+    child.sendRaw('{"jsonrpc":"2.0",not-json}\n');
+    child.stderr.write("parser crash detail\n");
+    child.emit("exit", 12, null);
+    child.stdout.end();
+    child.stderr.end();
+
+    await expect(pending).rejects.toMatchObject({
+      name: "AcpProtocolError",
+      code: "PROTOCOL_ERROR",
+      exitCode: 12,
+      stderr: "parser crash detail\n",
+      cause: {
+        name: "AcpProtocolError",
+        code: "PROTOCOL_ERROR",
+      },
+    });
+  });
+
+  it("reports unterminated crash JSON as a process exit with the parse failure as its cause", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "initialize",
+    ]);
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    const pending = client.initialize();
+    await new Promise((resolve) => setImmediate(resolve));
+    child.sendRaw('{"jsonrpc":"2.0","id":');
+    child.stderr.write("panic: stdout writer aborted\n");
+    child.emit("exit", 17, null);
+    child.stdout.end();
+    child.stderr.end();
+
+    await expect(pending).rejects.toMatchObject({
+      name: "AcpProcessExitError",
+      code: "PROCESS_EXIT",
+      exitCode: 17,
+      stderr: "panic: stdout writer aborted\n",
+      cause: {
+        name: "AcpProtocolError",
+        code: "PROTOCOL_ERROR",
+        data: { unterminatedAtEof: true },
+      },
+    });
+  });
+
+  it("keeps unterminated JSON on a clean exit as a protocol error", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "initialize",
+    ]);
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    const pending = client.initialize();
+    await new Promise((resolve) => setImmediate(resolve));
+    child.sendRaw('{"jsonrpc":"2.0","id":');
+    child.emit("exit", 0, null);
+    child.stdout.end();
+    child.stderr.end();
+
+    await expect(pending).rejects.toMatchObject({
+      name: "AcpProtocolError",
+      code: "PROTOCOL_ERROR",
+      exitCode: 0,
+      data: { unterminatedAtEof: true },
+    });
   });
 
   it("bounds shutdown and escalates from cancellation through SIGKILL", async () => {
@@ -965,7 +2107,7 @@ describe("AcpClient failures", () => {
         code: "CLIENT_DISPOSED",
       });
       const disposal = client.dispose();
-      await vi.runAllTimersAsync();
+      await vi.advanceTimersByTimeAsync(1_000);
       await disposal;
       await rejection;
 
@@ -978,6 +2120,79 @@ describe("AcpClient failures", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("keeps CLIENT_DISPOSED authoritative when cancel writes fail with EIO", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/prompt",
+    ]);
+    const client = new AcpClient({
+      authMethod: false,
+      cancelGraceMs: 0,
+      spawn: () => child,
+    });
+    const session = await client.newSession({
+      cwd: "/fixture",
+      mcpServers: [],
+    });
+    const prompt = client.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "wait" }],
+    });
+    const rejection = expect(prompt).rejects.toMatchObject({
+      code: "CLIENT_DISPOSED",
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    vi.spyOn(child.stdin, "write").mockImplementationOnce(() => {
+      throw Object.assign(new Error("cancel write EIO"), { code: "EIO" });
+    });
+
+    await expect(client.dispose()).resolves.toBeUndefined();
+    await rejection;
+    expect(client.failure).toBeUndefined();
+    expect(child.killSignals).toEqual(["SIGTERM"]);
+  });
+
+  it("ignores kill errors emitted during disposal", async () => {
+    class KillErrorChild extends FixtureChild {
+      override kill(signal?: NodeJS.Signals | number): boolean {
+        this.killSignals.push(signal);
+        this.emit(
+          "error",
+          Object.assign(new Error("kill EPERM"), { code: "EPERM" }),
+        );
+        this.stdout.end();
+        this.stderr.end();
+        this.emit("exit", null, typeof signal === "string" ? signal : null);
+        return false;
+      }
+    }
+
+    const child = new KillErrorChild(readFixture("text-only.jsonl"), [
+      "session/prompt",
+    ]);
+    const client = new AcpClient({
+      authMethod: false,
+      cancelGraceMs: 0,
+      spawn: () => child,
+    });
+    const session = await client.newSession({
+      cwd: "/fixture",
+      mcpServers: [],
+    });
+    const prompt = client.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "wait" }],
+    });
+    const rejection = expect(prompt).rejects.toMatchObject({
+      code: "CLIENT_DISPOSED",
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    await expect(client.dispose()).resolves.toBeUndefined();
+    await rejection;
+    expect(client.failure).toBeUndefined();
+    expect(child.killSignals).toEqual(["SIGTERM"]);
   });
 
   it("preserves an authentication-required initialize JSON-RPC response", async () => {
@@ -1007,7 +2222,7 @@ describe("AcpClient failures", () => {
 });
 
 describe("AcpClient agent requests", () => {
-  it("continues reading other sessions while a permission decision is pending", async () => {
+  it("continues another session while a permission decision is pending", async () => {
     const child = new FixtureChild(readFixture("text-only.jsonl"), [
       "session/prompt",
     ]);
@@ -1067,7 +2282,12 @@ describe("AcpClient agent requests", () => {
       result: { stopReason: "end_turn" },
     });
 
-    await expect(prompt).resolves.toMatchObject({ stopReason: "end_turn" });
+    let promptSettled = false;
+    void prompt.finally(() => {
+      promptSettled = true;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(promptSettled).toBe(true);
     expect(updates).toEqual(["agent_message_chunk"]);
     expect(
       child.requests.some(
@@ -1077,6 +2297,7 @@ describe("AcpClient agent requests", () => {
     ).toBe(false);
     expect(client.isIdle).toBe(false);
 
+    await expect(prompt).resolves.toMatchObject({ stopReason: "end_turn" });
     decidePermission({
       outcome: { outcome: "selected", optionId: "allow" },
     });
@@ -1088,6 +2309,297 @@ describe("AcpClient agent requests", () => {
       }),
     );
     await vi.waitFor(() => expect(client.isIdle).toBe(true));
+    await client.dispose();
+  });
+
+  it("delivers a tool update before its permission request", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"));
+    let releaseUpdate!: () => void;
+    const updateReleased = new Promise<void>((resolve) => {
+      releaseUpdate = resolve;
+    });
+    let updateStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      updateStarted = resolve;
+    });
+    const order: string[] = [];
+    const client = new AcpClient({
+      authMethod: false,
+      spawn: () => child,
+      onUpdate: async () => {
+        order.push("update-start");
+        updateStarted();
+        await updateReleased;
+        order.push("update-finish");
+      },
+      onPermissionRequest: () => {
+        order.push("permission");
+        return { outcome: { outcome: "selected", optionId: "allow" } };
+      },
+    });
+    await client.initialize();
+    child.send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "session-order",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call-order",
+          title: "Run",
+          rawInput: {},
+        },
+      },
+    });
+    child.send({
+      jsonrpc: "2.0",
+      id: "permission-order",
+      method: "session/request_permission",
+      params: {
+        sessionId: "session-order",
+        toolCall: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call-order",
+        },
+        options: [
+          { optionId: "allow", name: "Allow once", kind: "allow_once" },
+        ],
+      },
+    });
+
+    await started;
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(order).toEqual(["update-start"]);
+    releaseUpdate();
+    await vi.waitFor(() =>
+      expect(child.requests).toContainEqual({
+        jsonrpc: "2.0",
+        id: "permission-order",
+        result: { outcome: { outcome: "selected", optionId: "allow" } },
+      }),
+    );
+    expect(order).toEqual(["update-start", "update-finish", "permission"]);
+    await client.dispose();
+  });
+
+  it("cancels a queued permission before invoking approval logic", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"));
+    let releaseRead!: () => void;
+    const heldRead = new Promise<void>((resolve) => {
+      releaseRead = resolve;
+    });
+    let readStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      readStarted = resolve;
+    });
+    const onPermissionRequest = vi.fn(
+      (): AcpRequestPermissionResult => ({
+        outcome: { outcome: "selected", optionId: "allow" },
+      }),
+    );
+    const client = new AcpClient({
+      authMethod: false,
+      alwaysApprove: true,
+      onPermissionRequest,
+      spawn: () => child,
+      fileSystem: {
+        readTextFile: async () => {
+          readStarted();
+          await heldRead;
+          return { content: "fixture" };
+        },
+      },
+    });
+    await client.initialize();
+    child.send({
+      jsonrpc: "2.0",
+      id: "held-read",
+      method: "fs/read_text_file",
+      params: {
+        sessionId: "session-cancelled",
+        path: "/fixture/file.txt",
+      },
+    });
+    await started;
+    child.send({
+      jsonrpc: "2.0",
+      id: "queued-permission",
+      method: "session/request_permission",
+      params: {
+        sessionId: "session-cancelled",
+        toolCall: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call-cancelled",
+        },
+        options: [
+          { optionId: "allow", name: "Allow once", kind: "allow_once" },
+        ],
+      },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    await client.cancelSession("session-cancelled");
+    releaseRead();
+
+    await vi.waitFor(() =>
+      expect(child.requests).toContainEqual({
+        jsonrpc: "2.0",
+        id: "queued-permission",
+        result: { outcome: { outcome: "cancelled" } },
+      }),
+    );
+    expect(onPermissionRequest).not.toHaveBeenCalled();
+    expect(child.requests).not.toContainEqual({
+      jsonrpc: "2.0",
+      id: "queued-permission",
+      result: { outcome: { outcome: "selected", optionId: "allow" } },
+    });
+    await client.dispose();
+  });
+
+  it("cancels a pending permission before closing stdin during disposal", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"));
+    let decidePermission!: (result: AcpRequestPermissionResult) => void;
+    let permissionStarted = false;
+    const client = new AcpClient({
+      authMethod: false,
+      spawn: () => child,
+      onPermissionRequest: () =>
+        new Promise<AcpRequestPermissionResult>((resolve) => {
+          permissionStarted = true;
+          decidePermission = resolve;
+        }),
+    });
+    await client.initialize();
+    child.send({
+      jsonrpc: "2.0",
+      id: "permission-dispose",
+      method: "session/request_permission",
+      params: {
+        sessionId: "session-dispose",
+        toolCall: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call-dispose",
+        },
+        options: [
+          { optionId: "allow", name: "Allow once", kind: "allow_once" },
+        ],
+      },
+    });
+    await vi.waitFor(() => expect(permissionStarted).toBe(true));
+
+    await expect(client.dispose()).resolves.toBeUndefined();
+    decidePermission({
+      outcome: { outcome: "selected", optionId: "allow" },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(client.failure).toBeUndefined();
+  });
+
+  it("processes filesystem writes to the same path in FIFO order", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"));
+    const started: string[] = [];
+    let releaseFirst!: () => void;
+    const firstHeld = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const client = new AcpClient({
+      authMethod: false,
+      spawn: () => child,
+      fileSystem: {
+        writeTextFile: async ({ content }) => {
+          started.push(content);
+          if (content === "first") await firstHeld;
+          return null;
+        },
+      },
+    });
+    await client.initialize();
+    for (const [id, content] of [
+      ["write-first", "first"],
+      ["write-second", "second"],
+    ] as const) {
+      child.send({
+        jsonrpc: "2.0",
+        id,
+        method: "fs/write_text_file",
+        params: {
+          sessionId: "session-write",
+          path: "/fixture/shared.txt",
+          content,
+        },
+      });
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(started).toEqual(["first"]);
+    expect(client.isIdle).toBe(false);
+
+    releaseFirst();
+    await vi.waitFor(() =>
+      expect(
+        child.requests.filter(
+          (message) =>
+            !("method" in message) &&
+            ["write-first", "write-second"].includes(String(message.id)),
+        ),
+      ).toHaveLength(2),
+    );
+    expect(started).toEqual(["first", "second"]);
+    const responses = child.requests.filter(
+      (message) =>
+        !("method" in message) &&
+        ["write-first", "write-second"].includes(String(message.id)),
+    );
+    expect(
+      responses.map((response) => ("id" in response ? response.id : null)),
+    ).toEqual(["write-first", "write-second"]);
+    await vi.waitFor(() => expect(client.isIdle).toBe(true));
+    await client.dispose();
+  });
+
+  it("reports process exit without waiting for a hung file handler", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/prompt",
+    ]);
+    let handlerStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      handlerStarted = resolve;
+    });
+    const client = new AcpClient({
+      authMethod: false,
+      spawn: () => child,
+      fileSystem: {
+        readTextFile: async () => {
+          handlerStarted();
+          return await new Promise(() => undefined);
+        },
+      },
+    });
+    const session = await client.newSession({
+      cwd: "/fixture",
+      mcpServers: [],
+    });
+    const prompt = client.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "wait" }],
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    child.send({
+      jsonrpc: "2.0",
+      id: "hung-read",
+      method: "fs/read_text_file",
+      params: {
+        sessionId: session.sessionId,
+        path: "/fixture/hung.txt",
+      },
+    });
+    await started;
+    child.failWithStderr("agent exited while handler was pending\n", 17);
+
+    await expect(prompt).rejects.toMatchObject({
+      name: "AcpProcessExitError",
+      exitCode: 17,
+    });
     await client.dispose();
   });
 
@@ -1184,6 +2696,83 @@ describe("AcpClient agent requests", () => {
     ).toContain("reject (reject_once: Reject)");
     await client.dispose();
   });
+
+  it("validates custom permission handler selections", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"));
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    client.registerRequestHandler("session/request_permission", () => ({
+      outcome: { outcome: "selected", optionId: "unknown" },
+    }));
+    await client.initialize();
+
+    child.send({
+      jsonrpc: "2.0",
+      id: "permission-custom",
+      method: "session/request_permission",
+      params: {
+        sessionId: "session-1",
+        toolCall: { sessionUpdate: "tool_call_update", toolCallId: "call-3" },
+        options: [{ optionId: "reject", name: "Reject", kind: "reject_once" }],
+      },
+    });
+
+    await vi.waitFor(() =>
+      expect(child.requests).toContainEqual({
+        jsonrpc: "2.0",
+        id: "permission-custom",
+        error: {
+          code: -32001,
+          message:
+            "Permission callback selected unknown option 'unknown'. Options: reject (reject_once: Reject).",
+        },
+      }),
+    );
+    await client.dispose();
+  });
+
+  it.each([
+    ["undefined", undefined, "invalid result"],
+    ["malformed", { outcome: {} }, "invalid outcome"],
+  ])(
+    "returns a clear permission error for a %s handler result",
+    async (label, handlerResult, expectedMessage) => {
+      const child = new FixtureChild(readFixture("text-only.jsonl"));
+      const client = new AcpClient({ authMethod: false, spawn: () => child });
+      client.registerRequestHandler(
+        "session/request_permission",
+        () => handlerResult as never,
+      );
+      await client.initialize();
+
+      child.send({
+        jsonrpc: "2.0",
+        id: `permission-${label}`,
+        method: "session/request_permission",
+        params: {
+          sessionId: "session-1",
+          toolCall: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "call-4",
+          },
+          options: [
+            { optionId: "reject", name: "Reject", kind: "reject_once" },
+          ],
+        },
+      });
+
+      await vi.waitFor(() =>
+        expect(child.requests).toContainEqual({
+          jsonrpc: "2.0",
+          id: `permission-${label}`,
+          error: {
+            code: -32001,
+            message: expect.stringContaining(expectedMessage),
+          },
+        }),
+      );
+      await client.dispose();
+    },
+  );
 
   it("advertises and handles filesystem RPCs only when explicitly enabled", async () => {
     const child = new FixtureChild(readFixture("text-only.jsonl"));
@@ -1376,5 +2965,286 @@ describe("AcpClient prompt concurrency", () => {
     expect(client.failure).toBeUndefined();
     expect(client.isUsable).toBe(true);
     await client.dispose();
+  });
+
+  it("does not let a blocked session callback delay another session", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/prompt",
+    ]);
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    await client.initialize();
+    let releaseFirst!: () => void;
+    const firstReleased = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let firstStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      firstStarted = resolve;
+    });
+    const secondUpdates: string[] = [];
+    const first = client.prompt(
+      {
+        sessionId: "session-a",
+        prompt: [{ type: "text", text: "first" }],
+      },
+      {
+        onUpdate: async () => {
+          firstStarted();
+          await firstReleased;
+        },
+      },
+    );
+    const second = client.prompt(
+      {
+        sessionId: "session-b",
+        prompt: [{ type: "text", text: "second" }],
+      },
+      {
+        onUpdate: ({ update }) => {
+          secondUpdates.push(update.sessionUpdate);
+        },
+      },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    const requests = child.requests.filter(
+      (message) => "method" in message && message.method === "session/prompt",
+    ) as JsonRpcRequest[];
+    const requestFor = (sessionId: string) =>
+      requests.find(
+        (request) =>
+          isRecord(request.params) && request.params.sessionId === sessionId,
+      ) as JsonRpcRequest;
+
+    child.send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "session-a",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "blocked" },
+        },
+      },
+    });
+    child.send({
+      jsonrpc: "2.0",
+      id: requestFor("session-a").id,
+      result: { stopReason: "end_turn" },
+    });
+    await started;
+    child.send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "session-b",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "healthy" },
+        },
+      },
+    });
+    child.send({
+      jsonrpc: "2.0",
+      id: requestFor("session-b").id,
+      result: { stopReason: "end_turn" },
+    });
+
+    await expect(second).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(secondUpdates).toEqual(["agent_message_chunk"]);
+    releaseFirst();
+    await expect(first).resolves.toMatchObject({ stopReason: "end_turn" });
+    await client.dispose();
+  });
+
+  it("keeps prompt deadlines active and skips queued callbacks after timeout", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/prompt",
+    ]);
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    await client.initialize();
+    vi.useFakeTimers();
+    try {
+      let releaseUpdate!: () => void;
+      const updateReleased = new Promise<void>((resolve) => {
+        releaseUpdate = resolve;
+      });
+      let updateStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        updateStarted = resolve;
+      });
+      let callbackCount = 0;
+      const prompt = client.prompt(
+        {
+          sessionId: "session-timeout",
+          prompt: [{ type: "text", text: "wait" }],
+        },
+        {
+          timeoutMs: 25,
+          onUpdate: async () => {
+            callbackCount++;
+            if (callbackCount === 1) {
+              updateStarted();
+              await updateReleased;
+            }
+          },
+        },
+      );
+      const rejection = expect(prompt).rejects.toMatchObject({
+        name: "AcpTimeoutError",
+        code: "TIMEOUT",
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      const request = child.requests.find(
+        (message) => "method" in message && message.method === "session/prompt",
+      ) as JsonRpcRequest;
+      for (const text of ["first", "second"]) {
+        child.send({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId: "session-timeout",
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text },
+            },
+          },
+        });
+      }
+      child.send({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { stopReason: "end_turn" },
+      });
+
+      await started;
+      await vi.advanceTimersByTimeAsync(25);
+      await rejection;
+      releaseUpdate();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(callbackCount).toBe(1);
+    } finally {
+      vi.useRealTimers();
+      await client.dispose();
+    }
+  });
+
+  it("deactivates queued prompt callbacks as soon as the prompt is aborted", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/prompt",
+    ]);
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    await client.initialize();
+    let releaseUpdate!: () => void;
+    const updateReleased = new Promise<void>((resolve) => {
+      releaseUpdate = resolve;
+    });
+    let updateStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      updateStarted = resolve;
+    });
+    let callbackCount = 0;
+    const controller = new AbortController();
+    const prompt = client.prompt(
+      {
+        sessionId: "session-abort",
+        prompt: [{ type: "text", text: "wait" }],
+      },
+      {
+        signal: controller.signal,
+        onUpdate: async () => {
+          callbackCount++;
+          if (callbackCount === 1) {
+            updateStarted();
+            await updateReleased;
+          }
+        },
+      },
+    );
+    const rejection = expect(prompt).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    for (const text of ["first", "second"]) {
+      child.send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "session-abort",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text },
+          },
+        },
+      });
+    }
+
+    await started;
+    controller.abort();
+    releaseUpdate();
+    await rejection;
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(callbackCount).toBe(1);
+    await client.dispose();
+  });
+
+  it("keeps disposal active while a response awaits callbacks", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/prompt",
+    ]);
+    let releaseUpdate!: () => void;
+    const updateReleased = new Promise<void>((resolve) => {
+      releaseUpdate = resolve;
+    });
+    let updateStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      updateStarted = resolve;
+    });
+    const client = new AcpClient({
+      authMethod: false,
+      cancelGraceMs: 0,
+      spawn: () => child,
+    });
+    await client.initialize();
+    const prompt = client.prompt(
+      {
+        sessionId: "session-dispose-callback",
+        prompt: [{ type: "text", text: "wait" }],
+      },
+      {
+        onUpdate: async () => {
+          updateStarted();
+          await updateReleased;
+        },
+      },
+    );
+    const rejection = expect(prompt).rejects.toMatchObject({
+      code: "CLIENT_DISPOSED",
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    const request = child.requests.find(
+      (message) => "method" in message && message.method === "session/prompt",
+    ) as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "session-dispose-callback",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "held" },
+        },
+      },
+    });
+    child.send({
+      jsonrpc: "2.0",
+      id: request.id,
+      result: { stopReason: "end_turn" },
+    });
+    await started;
+
+    const disposal = client.dispose();
+    releaseUpdate();
+    await rejection;
+    await disposal;
   });
 });

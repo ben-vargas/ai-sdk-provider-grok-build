@@ -59,7 +59,7 @@ After `session/new` or `session/load`, the provider uses ACP `session/set_config
 
 ### `grokAgent`: pooled persistent ACP
 
-`grokAgent` reuses clients by effective process and callback configuration. Model and effort do not split the pool because Grok 1.x makes them session-scoped. Prompts and configuration changes for one session are serialized; different sessions can run concurrently.
+`grokAgent` reuses clients by effective process and callback configuration. Model and effort do not split the pool because Grok 1.x makes them session-scoped. Prompts, callback delivery, permission requests, and configuration changes for one session are serialized; different sessions continue concurrently.
 
 ```ts
 import { generateText } from "ai";
@@ -81,7 +81,7 @@ try {
 }
 ```
 
-`close()` stops new acquisitions, cancels active sessions, and awaits the bounded cancel → `SIGTERM` → `SIGKILL` ladder, including detached eviction work. `await agent[Symbol.asyncDispose]()` is equivalent. Calling one of them is mandatory for pooled providers, including the exported `grokAgent` singleton, because pooled child processes deliberately have no idle timer or shutdown hook. The pool defaults to eight process identities; at capacity it evicts the least-recently-used idle client and rejects a new identity with `POOL_CAPACITY_EXCEEDED` when all clients are active. Active generation leases prevent eviction between ACP requests. An exited pooled client is replaced on the next acquisition.
+`close()` stops new acquisitions, cancels active sessions, and awaits the bounded cancel → `SIGTERM` → `SIGKILL` ladder, including detached eviction and retirement work. `await agent[Symbol.asyncDispose]()` is equivalent. Calling one of them is mandatory for pooled providers, including the exported `grokAgent` singleton, because pooled child processes deliberately have no idle timer or shutdown hook. The pool defaults to eight process identities; at capacity it evicts the least-recently-used idle client and rejects a new identity with `POOL_CAPACITY_EXCEEDED` when all clients are active. Active generation leases prevent eviction between ACP requests. An unusable client is removed from lookup and replaced without interrupting its in-flight requests while terminal diagnostics are still being collected; the retired client is disposed after that bounded settlement completes.
 
 ### `grokExec`: headless and native schemas
 
@@ -147,7 +147,7 @@ Shared process settings are available in every mode:
 
 ACP settings additionally include `authMethod`, `reasoningEffort`, `mcpServers`, `includeRawChunks`, `permissionMode`, `alwaysApprove`, `dangerouslySkipPermissions`, `onPermissionRequest`, and filesystem handlers.
 
-`createGrokAgent` also accepts `maxClients`, a positive integer that defaults to `8`.
+`createGrokAgent` also accepts `maxClients`, a positive integer that defaults to `8`. ACP response validation happens before initialization or session state is cached. Select configuration options may be flat or grouped; boolean and future option kinds are retained without being mistaken for model selectors.
 
 Exec settings additionally include:
 
@@ -179,6 +179,8 @@ const result = await generateText({
 
 ACP options include `model`, `reasoningEffort`, `session`, `permissionMode`, `mcpServers`, `maxTurns`, `includeExtensionEvents`, `alwaysApprove`, and `dangerouslySkipPermissions`.
 
+Call-level permission booleans use explicit precedence, so `dangerouslySkipPermissions: false` disables only a provider-level dangerous bypass for that call. It does not reset an independently configured `permissionMode` or `alwaysApprove` value.
+
 Exec options override its flag settings and session controls. `session.resume` and `session.continue` are mutually exclusive; `session.fork` requires one of them; `session.id` creates a new ID or names a fork:
 
 ```ts
@@ -208,23 +210,23 @@ ACP permission requests fail closed when no callback is installed. Only explicit
 
 Abort and stream cancellation preserve the caller's reason, cancel the ACP session or terminate the headless child, and use bounded escalation so orphan processes are not left behind. Tool side effects already started by Grok cannot be rolled back.
 
-Automatic retries are limited to failures proven to happen before prompt dispatch. Prompt timeouts, missing terminal records, non-zero headless exits, explicit headless error events, and ACP exits after dispatch are non-retryable because a tool side effect may already have occurred.
+Automatic retries are limited to failures proven to happen before prompt dispatch. ACP timeouts/process exits and generic JSON-RPC internal error `-32603` are retryable only before dispatch. Authentication-required `-32000` and credential-specific `-32603` responses (for example, token-refresh failures), missing-resource `-32002`, cancellation, prompt timeouts, missing terminal records, non-zero headless exits, explicit headless error events, and all post-dispatch failures are non-retryable because a tool side effect may already have occurred.
 
 ## Prompt and media behavior
 
 Roles and completed tool history are serialized as an explicit transcript. Textual files are inlined. Images, audio, binary files, custom parts, reasoning files, and private reasoning history are warned about and omitted; this package intentionally has no unused image-conversion layer.
 
-Raw ACP/headless events, tool inputs/outputs, usage, model catalogs, and extension metadata pass through credential redaction. Unknown benign events are preserved as redacted raw parts with one warning. Unknown events that could affect completion, usage, permissions, or tool correlation fail with a protocol error.
+Raw ACP/headless events, tool inputs/outputs, usage, model catalogs, and extension metadata pass through credential redaction. Unknown benign events are preserved as redacted raw parts with one warning. Metadata-only updates after a tool's final result are ignored semantically; pending or in-progress regressions still fail. Unknown events that could affect completion, usage, permissions, or tool correlation fail with a protocol error.
 
 ## Live verification
 
-`npm run test:live` builds the package and runs an opt-in smoke test against the installed, authenticated Grok CLI. It verifies the CLI version, implicit headless `dontAsk` behavior, native usage invariants, and a pooled ACP generation in a temporary directory. It is intentionally excluded from CI because it consumes account usage and may create ordinary Grok session metadata.
+`npm run test:live` builds the package and runs an opt-in smoke test against the installed, authenticated Grok CLI. It verifies the CLI version, native usage invariants, denial of a marker-writing shell command under implicit headless `dontAsk`, and a pooled ACP generation in a temporary directory. It is intentionally excluded from CI because it consumes account usage and may create ordinary Grok session metadata.
 
 ## More examples and limitations
 
 See [examples](examples/README.md), [session continuity](docs/session-continuity.md), [known limitations](LIMITATIONS.md), and the fixture-backed [gap analysis](GAP_ANALYSIS.md).
 
-The root export includes `AcpClient` and its protocol/process types as a supported low-level surface. Its idempotent `acquireLease()` method keeps a client non-idle across a multi-request lifecycle and is intended primarily for pooled integrations. `embeddingModel()` and `imageModel()` throw `NoSuchModelError`; other non-language provider factories are not implemented.
+The root export includes `AcpClient` and its protocol/process types as a supported low-level surface. Its idempotent `acquireLease()` method keeps a client non-idle across a multi-request lifecycle and is intended primarily for pooled integrations. Consumer update and extension callbacks are observational: their exceptions are isolated, but a request preserves update-before-result ordering by waiting for callbacks already queued for its session. The request's timeout, abort signal, disposal, and process-failure handling remain active during that wait, so callback flushing cannot make settlement unbounded. When constructing `GrokBuildLanguageModel` with a custom `clientFactory`, generated ACP `args` are omitted so the wrapper retains ownership of its command line. Such a factory must translate process-level permission settings into its own command line: client-side `permissionMode` and `alwaysApprove` control ACP permission responses but do not put the child CLI into plan mode. Real-CLI factories can opt into the built-in command resolution, version validation, and generated arguments with `validateCli: true`; built-in providers enable that path automatically. `embeddingModel()` and `imageModel()` throw `NoSuchModelError`; other non-language provider factories are not implemented.
 
 ## License
 

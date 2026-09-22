@@ -1,6 +1,7 @@
 import {
   AcpClient,
   resolveAcpClientOptions,
+  waitForAcpClientTerminalFailure,
   type AcpClientOptions,
 } from "./client.js";
 import { AcpError } from "./errors.js";
@@ -43,6 +44,7 @@ export class AcpClientPool {
   private readonly maxClients: number;
   private usageClock = 0;
   private readonly pendingDisposals = new Set<Promise<void>>();
+  private readonly retiredClients = new Set<AcpClient>();
   private closing = false;
   private closePromise?: Promise<void>;
 
@@ -88,12 +90,12 @@ export class AcpClientPool {
     }
     if (existing) {
       this.clients.delete(key);
-      this.disposeDetached(existing.client);
+      this.retire(existing.client);
     }
     for (const [staleKey, entry] of this.clients) {
       if (!entry.client.isUsable) {
         this.clients.delete(staleKey);
-        this.disposeDetached(entry.client);
+        this.retire(entry.client);
       }
     }
     if (this.clients.size >= this.maxClients) {
@@ -117,19 +119,33 @@ export class AcpClientPool {
   async close(): Promise<void> {
     this.closing = true;
     this.closePromise ??= (async () => {
+      const clients = new Set([
+        ...[...this.clients.values()].map(({ client }) => client),
+        ...this.retiredClients,
+      ]);
       await Promise.allSettled([
-        ...[...this.clients.values()].map(
-          async ({ client }) => await client.dispose(),
-        ),
+        ...[...clients].map(async (client) => await client.dispose()),
         ...this.pendingDisposals,
       ]);
       this.clients.clear();
+      this.retiredClients.clear();
     })();
     await this.closePromise;
   }
 
   private disposeDetached(client: AcpClient): void {
     const disposal = client.dispose().catch(() => undefined);
+    this.pendingDisposals.add(disposal);
+    void disposal.then(() => this.pendingDisposals.delete(disposal));
+  }
+
+  private retire(client: AcpClient): void {
+    if (this.retiredClients.has(client)) return;
+    this.retiredClients.add(client);
+    const disposal = waitForAcpClientTerminalFailure(client)
+      .then(async () => await client.dispose())
+      .catch(() => undefined)
+      .finally(() => this.retiredClients.delete(client));
     this.pendingDisposals.add(disposal);
     void disposal.then(() => this.pendingDisposals.delete(disposal));
   }

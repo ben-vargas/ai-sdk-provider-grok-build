@@ -19,6 +19,7 @@ import type {
 } from "@ai-sdk/provider";
 import { APICallError } from "@ai-sdk/provider";
 import { parseProviderOptions } from "@ai-sdk/provider-utils";
+import { abortError } from "./abort.js";
 import { NdjsonFramer } from "./acp/client.js";
 import { AcpProtocolError, stderrTail } from "./acp/errors.js";
 import type { JsonValue } from "./acp/protocol.js";
@@ -37,6 +38,7 @@ import { GrokBuildV4StreamEmitter } from "./map-v4-events.js";
 import { mapGrokBuildUsage, grokBuildProviderMetadata } from "./map-usage.js";
 import type { NormalizedCompletionMetadata } from "./normalized-usage.js";
 import { redactSensitiveData } from "./redact.js";
+import { isRecord } from "./type-guards.js";
 import {
   grokExecProviderOptionsSchema,
   validateGrokBuildModelId,
@@ -150,13 +152,6 @@ function normalizeUsage(source?: Record<string, unknown>) {
     ),
     raw: source ? redactSensitiveData(source) : undefined,
   };
-}
-
-function abortError(signal: AbortSignal): Error {
-  if (signal.reason instanceof Error) return signal.reason;
-  const error = new Error("The Grok CLI call was aborted.");
-  error.name = "AbortError";
-  return error;
 }
 
 function delay(milliseconds: number): Promise<void> {
@@ -409,7 +404,7 @@ export class GrokExecLanguageModel implements LanguageModelV4 {
     };
     if (options.abortSignal?.aborted) {
       await cleanup();
-      throw abortError(options.abortSignal);
+      throw abortError(options.abortSignal, "The Grok CLI call was aborted.");
     }
 
     let terminate: ((reason?: unknown) => Promise<void>) | undefined;
@@ -621,7 +616,7 @@ export class GrokExecLanguageModel implements LanguageModelV4 {
         const onAbort = (): void => {
           if (promptTimer) clearTimeout(promptTimer);
           const reason = options.abortSignal
-            ? abortError(options.abortSignal)
+            ? abortError(options.abortSignal, "The Grok CLI call was aborted.")
             : new Error("The Grok CLI call was aborted.");
           if (!closed) {
             closed = true;
@@ -705,12 +700,12 @@ export class GrokExecLanguageModel implements LanguageModelV4 {
         cause,
       });
     }
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    if (!isRecord(parsed)) {
       throw new AcpProtocolError(
         "Grok structured output must be a JSON object wrapper.",
       );
     }
-    const wrapper = parsed as Record<string, unknown>;
+    const wrapper = parsed;
     const stopReason =
       typeof wrapper.stopReason === "string"
         ? wrapper.stopReason
@@ -730,7 +725,9 @@ export class GrokExecLanguageModel implements LanguageModelV4 {
         ? wrapper.structuredOutput
         : wrapper.structured_output
       : Object.hasOwn(wrapper, "result")
-        ? wrapper.result
+        ? wrapper.result === null && typeof wrapper.text === "string"
+          ? wrapper.text
+          : wrapper.result
         : wrapper.text;
     if (value === undefined) {
       throw new AcpProtocolError(
@@ -768,10 +765,7 @@ export class GrokExecLanguageModel implements LanguageModelV4 {
           : typeof wrapper.request_id === "string"
             ? wrapper.request_id
             : undefined,
-      usage:
-        wrapper.usage && typeof wrapper.usage === "object"
-          ? (wrapper.usage as Record<string, unknown>)
-          : undefined,
+      usage: isRecord(wrapper.usage) ? wrapper.usage : undefined,
       modelUsage: wrapper.modelUsage ?? wrapper.model_usage,
     };
   }

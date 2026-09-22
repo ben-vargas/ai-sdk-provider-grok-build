@@ -7,6 +7,7 @@ import type {
   JsonValue,
 } from "./acp/protocol.js";
 import { redactSensitiveData } from "./redact.js";
+import { isRecord } from "./type-guards.js";
 
 export interface NormalizedCompatibilityWarning {
   kind: "compatibility-warning";
@@ -43,10 +44,6 @@ export type NormalizedEvent =
 interface TrackedTool {
   name: string;
   finalEmitted: boolean;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function requiredString(

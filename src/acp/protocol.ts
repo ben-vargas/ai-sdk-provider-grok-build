@@ -187,21 +187,23 @@ export interface AcpReasoningEffort {
   id: string;
   value: string;
   label: string;
-  description?: string;
+  description?: string | null;
   default?: boolean;
 }
 
 export interface AcpModelInfo {
   modelId: string;
   name: string;
-  description?: string;
-  _meta?: AcpMeta & {
-    totalContextTokens?: number;
-    agentType?: string;
-    supportsReasoningEffort?: boolean;
-    reasoningEffort?: string;
-    reasoningEfforts?: AcpReasoningEffort[];
-  };
+  description?: string | null;
+  _meta?:
+    | (AcpMeta & {
+        totalContextTokens?: number;
+        agentType?: string;
+        supportsReasoningEffort?: boolean;
+        reasoningEffort?: string;
+        reasoningEfforts?: AcpReasoningEffort[];
+      })
+    | null;
 }
 
 export interface AcpModelState {
@@ -307,49 +309,79 @@ export interface AcpSessionResultMeta extends AcpMeta {
   feedbackEnabled?: boolean;
 }
 
-export interface AcpSessionResult {
-  sessionId: string;
+export interface AcpSessionState {
   models?: AcpModelState;
   modes?: AcpMeta;
   configOptions?: AcpConfigOption[];
   _meta?: AcpSessionResultMeta | null;
 }
 
+export interface AcpSessionResult extends AcpSessionState {
+  sessionId: string;
+}
+
 export interface AcpConfigSelectChoice {
   value: string;
-  name?: string;
-  description?: string;
+  name: string;
+  description?: string | null;
   _meta?: AcpMeta | null;
 }
 
-export interface AcpConfigOption {
+export interface AcpConfigSelectGroup {
+  group: string;
+  name: string;
+  options: AcpConfigSelectChoice[];
+  _meta?: AcpMeta | null;
+}
+
+export interface AcpConfigOptionBase {
   id: string;
-  name?: string;
-  description?: string;
-  category?: string;
-  type: "select" | (string & {});
-  currentValue?: string;
-  options?: AcpConfigSelectChoice[];
+  name: string;
+  description?: string | null;
+  category?: string | null;
   _meta?: AcpMeta | null;
 }
 
-export interface AcpSetConfigOptionParams {
+export interface AcpConfigSelectOption extends AcpConfigOptionBase {
+  type: "select";
+  currentValue: string;
+  options: AcpConfigSelectChoice[] | AcpConfigSelectGroup[];
+}
+
+export interface AcpConfigBooleanOption extends AcpConfigOptionBase {
+  type: "boolean";
+  currentValue: boolean;
+}
+
+/** A forward-compatible ACP configuration option not known to this version. */
+export interface AcpConfigUnknownOption extends AcpConfigOptionBase {
+  type: string & {};
+  currentValue?: JsonValue;
+  options?: JsonValue;
+  [key: string]: unknown;
+}
+
+export type AcpConfigOption =
+  | AcpConfigSelectOption
+  | AcpConfigBooleanOption
+  | AcpConfigUnknownOption;
+
+interface AcpSetConfigOptionBase {
   sessionId: string;
   configId: string;
-  value: string;
   _meta?: AcpMeta | null;
 }
+
+export type AcpSetConfigOptionParams = AcpSetConfigOptionBase &
+  ({ type: "boolean"; value: boolean } | { type?: string; value: string });
 
 export interface AcpSetConfigOptionResult {
   configOptions: AcpConfigOption[];
   _meta?: AcpMeta | null;
 }
 
-/** Stable ACP session/load returns an empty result after replay; Grok may add session state. */
-export type AcpLoadSessionResult =
-  | null
-  | Record<string, never>
-  | AcpSessionResult;
+/** Stable ACP session/load returns session state without repeating its session ID. */
+export type AcpLoadSessionResult = AcpSessionState | null;
 
 export interface AcpPromptParams {
   sessionId: string;

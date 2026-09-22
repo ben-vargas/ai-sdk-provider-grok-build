@@ -458,9 +458,51 @@ describe("GrokExecLanguageModel", () => {
     expect(result.warnings).toEqual([]);
   });
 
-  it("preserves a legacy structured result whose value is null", async () => {
+  it("uses legacy text when the structured result value is null", async () => {
     const { model } = fixtureModel(
       JSON.stringify({ result: null, text: "fallback", stopReason: "EndTurn" }),
+    );
+    const result = await model.doGenerate(
+      callOptions("json", {
+        responseFormat: { type: "json", schema: { type: "null" } },
+      }),
+    );
+
+    expect(result.content).toContainEqual({ type: "text", text: "fallback" });
+  });
+
+  it("serializes an explicit null result when no legacy text is present", async () => {
+    const { model } = fixtureModel(
+      JSON.stringify({ result: null, stopReason: "EndTurn" }),
+    );
+    const result = await model.doGenerate(
+      callOptions("json", {
+        responseFormat: { type: "json", schema: { type: "null" } },
+      }),
+    );
+
+    expect(result.content).toContainEqual({ type: "text", text: "null" });
+  });
+
+  it("rejects structured wrappers with no generated payload", async () => {
+    const { model } = fixtureModel(JSON.stringify({ stopReason: "EndTurn" }));
+
+    await expect(
+      model.doGenerate(
+        callOptions("json", {
+          responseFormat: { type: "json", schema: { type: "null" } },
+        }),
+      ),
+    ).rejects.toThrow("omitted the generated JSON payload");
+  });
+
+  it("preserves an explicit null structured output", async () => {
+    const { model } = fixtureModel(
+      JSON.stringify({
+        structuredOutput: null,
+        text: "fallback",
+        stopReason: "EndTurn",
+      }),
     );
     const result = await model.doGenerate(
       callOptions("json", {

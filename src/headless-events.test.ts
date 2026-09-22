@@ -130,13 +130,13 @@ describe("HeadlessEventNormalizer strictness", () => {
         status: "pending",
       }),
     ).toThrow("after its final result");
-    expect(() =>
+    expect(
       normalizer.normalize({
         type: "tool_call_update",
         id: "call",
         output: { progress: 100 },
       }),
-    ).toThrow("after its final result");
+    ).toEqual([expect.objectContaining({ kind: "raw", conditional: true })]);
   });
 
   it("fails completion when a tool call has no final result", () => {
