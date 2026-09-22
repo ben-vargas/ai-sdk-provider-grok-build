@@ -1,0 +1,9 @@
+# Verify external CLI behavior with sanitized fixtures
+
+Normal CI uses sanitized ACP and headless fixtures plus AI SDK integration tests so it remains deterministic, unauthenticated, and free of paid generation. Authenticated live verification is explicit and opt-in because it consumes account usage and may create ordinary Grok session metadata. Typechecking, tests, builds, and documentation validation also run on Windows Node 22 to protect path and launcher behavior; coverage, package dry-runs, and import smoke checks protect the published boundary without making external service availability a CI dependency.
+
+Workflow permissions are declared at least privilege with read-only repository contents. Third-party actions are pinned to reviewed commit SHAs, and checkout does not persist workflow credentials, limiting both mutable-tag supply-chain exposure and token access from later lifecycle steps.
+
+`npm run test:live` builds the package, creates an isolated temporary working directory, verifies the installed `grok --no-auto-update --version`, runs a headless sentinel with the implicit `dontAsk` mode and finite prompt deadline, validates native usage invariants, and runs one pooled ACP generation. Its permission check matches the platform path in serialized tool input using the same JSON-escaped marker form, tolerates a missing input value, requires the correlated final tool result to report `isError: true`, and verifies that the denied command did not create its marker file; generation completion alone is insufficient. The smoke always closes the pooled provider and removes its temporary directory.
+
+Cross-platform command fixtures execute through `process.execPath` where practical. Fixtures that intentionally validate a POSIX `#!/bin/sh` executable are skipped on Windows, while package-bin and `npx` cases remain explicitly skipped wherever Windows policy forbids them; the Windows Node 22 CI job verifies the native-executable path.

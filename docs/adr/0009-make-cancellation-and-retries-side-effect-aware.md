@@ -1,0 +1,3 @@
+# Make cancellation and retries side-effect-aware
+
+Cancellation preserves whichever abort, process failure, or explicit disposal settles an operation first, while prompt cancellation and process termination remain bounded and shared initialization work is isolated from any one caller's signal. Automatic retries are allowed only before ACP prompt dispatch when no external tool effects may have occurred; prompt-time failures and completed headless executions are never replayed. Prompt timeouts send `session/cancel` before releasing their session queue, and headless retries are limited to genuine spawn failures.

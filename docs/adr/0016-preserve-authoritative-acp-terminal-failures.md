@@ -1,0 +1,3 @@
+# Preserve authoritative ACP terminal failures
+
+Each ACP client settles one terminal-failure signal so an established spawn, process, or protocol cause cannot be overwritten by later pipe-close artifacts or disposal. Known terminal pipe failures remain provisional for a bounded diagnostic interval, allowing child exit status and complete stderr to become authoritative before the pipe failure is promoted and process escalation begins. Post-exit output draining uses its own internal bound so buffered correlated responses and malformed-output context are processed without inheriting request or termination timing.

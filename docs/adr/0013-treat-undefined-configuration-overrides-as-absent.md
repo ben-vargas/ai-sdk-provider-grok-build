@@ -1,0 +1,3 @@
+# Treat undefined configuration overrides as absent
+
+Provider defaults, model settings, nested timeout settings, and request-level exec options use defined-value merge semantics: an explicitly `undefined` override is treated as absent and cannot erase a configured default. Merges produce fresh settings objects so request-specific values do not mutate later calls. Environment maps are the deliberate exception: an own key whose value is `undefined` is preserved because Node child-process environments use it to remove an inherited variable, while other environment entries continue to merge normally.
