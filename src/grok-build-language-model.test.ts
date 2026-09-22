@@ -12,12 +12,16 @@ import {
   type AcpChildProcess,
   type AcpClientOptions,
 } from "./acp/client.js";
+import { AcpProtocolError } from "./acp/errors.js";
 import type {
   JsonRpcNotification,
   JsonRpcRequest,
   JsonRpcResponse,
 } from "./acp/protocol.js";
-import { GrokBuildLanguageModel } from "./grok-build-language-model.js";
+import {
+  buildAcpCommandArgs,
+  GrokBuildLanguageModel,
+} from "./grok-build-language-model.js";
 
 interface FixtureRow {
   dir: "in" | "out" | "stderr";
@@ -42,24 +46,27 @@ class FixtureChild extends EventEmitter implements AcpChildProcess {
     JsonRpcRequest | JsonRpcNotification | JsonRpcResponse
   > = [];
   readonly killSignals: Array<NodeJS.Signals | number | undefined> = [];
-  private readonly groups = new Map<string, unknown[]>();
+  private readonly groups = new Map<string, unknown[][]>();
+  private readonly groupIndexes = new Map<string, number>();
   private readonly heldMethods: Set<string>;
   private exited = false;
 
   constructor(rows: FixtureRow[], heldMethods: Iterable<string> = []) {
     super();
     this.heldMethods = new Set(heldMethods);
-    let currentMethod: string | undefined;
+    let currentGroup: unknown[] | undefined;
     for (const row of rows) {
       if (
         row.dir === "out" &&
         isRecord(row.msg) &&
         typeof row.msg.method === "string"
       ) {
-        currentMethod = row.msg.method;
-        this.groups.set(currentMethod, []);
-      } else if (row.dir === "in" && currentMethod && isRecord(row.msg)) {
-        this.groups.get(currentMethod)?.push(row.msg);
+        currentGroup = [];
+        const methodGroups = this.groups.get(row.msg.method) ?? [];
+        methodGroups.push(currentGroup);
+        this.groups.set(row.msg.method, methodGroups);
+      } else if (row.dir === "in" && currentGroup && isRecord(row.msg)) {
+        currentGroup.push(row.msg);
       }
     }
 
@@ -111,11 +118,20 @@ class FixtureChild extends EventEmitter implements AcpChildProcess {
       this.send({ jsonrpc: "2.0", id: requestId, result: {} });
       return;
     }
-    if (message.method === "session/load" && requestId !== undefined) {
+    if (
+      message.method === "session/load" &&
+      requestId !== undefined &&
+      !this.groups.has("session/load")
+    ) {
       this.send({ jsonrpc: "2.0", id: requestId, result: null });
       return;
     }
-    for (const original of this.groups.get(message.method) ?? []) {
+    const groups = this.groups.get(message.method) ?? [];
+    const groupIndex = this.groupIndexes.get(message.method) ?? 0;
+    const group =
+      groups[Math.min(groupIndex, Math.max(0, groups.length - 1))] ?? [];
+    this.groupIndexes.set(message.method, groupIndex + 1);
+    for (const original of group) {
       const response = structuredClone(original) as Record<string, unknown>;
       if ("id" in response && ("result" in response || "error" in response)) {
         response.id = requestId;
@@ -171,6 +187,69 @@ async function collect(
 }
 
 describe("GrokBuildLanguageModel", () => {
+  it("passes the default permission mode explicitly in ACP argv", () => {
+    expect(
+      buildAcpCommandArgs([], {
+        permissionMode: "default",
+        dangerouslySkipPermissions: false,
+        alwaysApprove: false,
+      }),
+    ).toEqual([
+      "--no-auto-update",
+      "--permission-mode",
+      "default",
+      "agent",
+      "stdio",
+    ]);
+  });
+
+  it("lets dangerous bypass supersede ordinary ACP permission flags", () => {
+    const args = buildAcpCommandArgs([], {
+      permissionMode: "plan",
+      dangerouslySkipPermissions: true,
+      alwaysApprove: true,
+    });
+
+    expect(args).toContain("--dangerously-skip-permissions");
+    expect(args).not.toContain("--permission-mode");
+    expect(args).not.toContain("--always-approve");
+  });
+
+  it("passes complete ACP arguments to a custom client factory", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"));
+    let captured: AcpClientOptions | undefined;
+    const model = new GrokBuildLanguageModel({
+      id: "grok-4.5",
+      settings: {
+        cwd: "/fixture",
+        permissionMode: "plan",
+        alwaysApprove: true,
+        xaiApiBaseUrl: "https://api.example.test",
+      },
+      clientFactory: (options) => {
+        captured = options;
+        return new AcpClient({
+          ...options,
+          authMethod: false,
+          spawn: () => child,
+        });
+      },
+    });
+
+    await model.doGenerate(promptOptions("ping"));
+
+    expect(captured?.args).toEqual([
+      "--no-auto-update",
+      "--permission-mode",
+      "plan",
+      "agent",
+      "--always-approve",
+      "--xai-api-base-url",
+      "https://api.example.test",
+      "stdio",
+    ]);
+  });
+
   it("maps the captured ACP tool lifecycle into a complete V4 stream", async () => {
     const { model } = fixtureModel("tool-use.jsonl", true);
     const result = await model.doStream(promptOptions("inspect"));
@@ -469,6 +548,134 @@ describe("GrokBuildLanguageModel", () => {
     await vi.waitFor(() => expect(child.killSignals).toContain("SIGTERM"));
   });
 
+  it("isolates a malformed update to its generation on a shared client", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/new",
+      "session/prompt",
+    ]);
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    const createModel = (): GrokBuildLanguageModel =>
+      new GrokBuildLanguageModel({
+        id: "grok-4.5",
+        settings: { cwd: "/fixture" },
+        clientFactory: () => client,
+        disposeClient: false,
+      });
+    const failedPreparation = createModel().doStream(promptOptions("bad"));
+    const healthyPreparation = createModel().doStream(promptOptions("good"));
+    await vi.waitFor(() => {
+      expect(
+        child.requests.filter(
+          (message) => "method" in message && message.method === "session/new",
+        ),
+      ).toHaveLength(2);
+    });
+    const sessionRequests = child.requests.filter(
+      (message) => "method" in message && message.method === "session/new",
+    ) as JsonRpcRequest[];
+    child.send({
+      jsonrpc: "2.0",
+      id: sessionRequests[0]?.id,
+      result: { sessionId: "session-bad" },
+    });
+    child.send({
+      jsonrpc: "2.0",
+      id: sessionRequests[1]?.id,
+      result: { sessionId: "session-good" },
+    });
+    const [failedStream, healthyStream] = await Promise.all([
+      failedPreparation,
+      healthyPreparation,
+    ]);
+    const failedResult = collect(failedStream.stream).catch(
+      (error: unknown) => error,
+    );
+    const healthyResult = collect(healthyStream.stream);
+    await vi.waitFor(() => {
+      expect(
+        child.requests.filter(
+          (message) =>
+            "method" in message && message.method === "session/prompt",
+        ),
+      ).toHaveLength(2);
+    });
+    const promptRequests = child.requests.filter(
+      (message) => "method" in message && message.method === "session/prompt",
+    ) as JsonRpcRequest[];
+    const healthyPrompt = promptRequests.find(
+      (request) =>
+        isRecord(request.params) && request.params.sessionId === "session-good",
+    );
+
+    child.send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "session-bad",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: 42 },
+        },
+      },
+    });
+    child.send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "session-good",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "healthy" },
+        },
+      },
+    });
+    child.send({
+      jsonrpc: "2.0",
+      id: healthyPrompt?.id,
+      result: { stopReason: "end_turn" },
+    });
+
+    const generationError = await failedResult;
+    expect(generationError).toBeInstanceOf(APICallError);
+    expect(generationError).toMatchObject({
+      cause: expect.any(AcpProtocolError),
+      isRetryable: false,
+      data: { code: "PROTOCOL_ERROR" },
+    });
+    expect(await healthyResult).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "text-delta", delta: "healthy" }),
+        expect.objectContaining({ type: "finish" }),
+      ]),
+    );
+    expect(client.isUsable).toBe(true);
+
+    const finalPrompt = client.prompt({
+      sessionId: "session-final",
+      prompt: [{ type: "text", text: "still usable" }],
+    });
+    await vi.waitFor(() => {
+      expect(
+        child.requests.filter(
+          (message) =>
+            "method" in message && message.method === "session/prompt",
+        ),
+      ).toHaveLength(3);
+    });
+    const finalRequest = child.requests.filter(
+      (message) => "method" in message && message.method === "session/prompt",
+    )[2] as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      id: finalRequest.id,
+      result: { stopReason: "end_turn" },
+    });
+    await expect(finalPrompt).resolves.toMatchObject({
+      stopReason: "end_turn",
+    });
+    await client.dispose();
+  });
+
   it("does not spawn for an already-aborted call", async () => {
     let spawned = false;
     const controller = new AbortController();
@@ -600,6 +807,96 @@ describe("GrokBuildLanguageModel", () => {
     );
   });
 
+  it("quarantines replay extension events emitted by session/load", async () => {
+    const { model, child } = fixtureModel("text-only.jsonl", true, [
+      "session/load",
+    ]);
+    const pending = model.doStream(
+      promptOptions("continue", {
+        providerOptions: {
+          "grok-build": { session: { id: "existing-session" } },
+        },
+      }),
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    const load = child.requests.find(
+      (message) => "method" in message && message.method === "session/load",
+    ) as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      method: "_x.ai/session/update",
+      params: {
+        sessionId: "existing-session",
+        update: { sessionUpdate: "agent_message_chunk", content: "old" },
+        _meta: { isReplay: true },
+      },
+    });
+    child.send({ jsonrpc: "2.0", id: load.id, result: null });
+    const parts = await collect((await pending).stream);
+    expect(
+      parts.some(
+        (part) =>
+          part.type === "raw" &&
+          isRecord(part.rawValue) &&
+          isRecord(part.rawValue.params) &&
+          isRecord(part.rawValue.params._meta) &&
+          part.rawValue.params._meta.isReplay === true,
+      ),
+    ).toBe(false);
+  });
+
+  it("captures pre-session extensions and filters other session notifications", async () => {
+    const { model, child } = fixtureModel("text-only.jsonl", true, [
+      "session/new",
+    ]);
+    const pending = model.doStream(promptOptions("inspect extensions"));
+    await new Promise((resolve) => setImmediate(resolve));
+    const sessionRequest = child.requests.find(
+      (message) => "method" in message && message.method === "session/new",
+    ) as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      method: "_x.ai/global/update",
+      params: { value: "initialization" },
+    });
+    child.send({
+      jsonrpc: "2.0",
+      method: "_x.ai/session/extension",
+      params: { sessionId: "session-one", value: "matching" },
+    });
+    child.send({
+      jsonrpc: "2.0",
+      method: "_x.ai/session/extension",
+      params: { sessionId: "session-other", value: "other" },
+    });
+    child.send({
+      jsonrpc: "2.0",
+      id: sessionRequest.id,
+      result: { sessionId: "session-one" },
+    });
+
+    const parts = await collect((await pending).stream);
+    const raw = parts
+      .filter((part) => part.type === "raw")
+      .map((part) => part.rawValue);
+    expect(raw).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ method: "_x.ai/global/update" }),
+        expect.objectContaining({
+          method: "_x.ai/session/extension",
+          params: expect.objectContaining({ value: "matching" }),
+        }),
+      ]),
+    );
+    expect(raw).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          params: expect.objectContaining({ value: "other" }),
+        }),
+      ]),
+    );
+  });
+
   it("warns when a requested model is absent from the advertised catalog", async () => {
     const { model } = fixtureModel(
       "text-only.jsonl",
@@ -624,10 +921,160 @@ describe("GrokBuildLanguageModel", () => {
     });
   });
 
+  it("selects the model and effort through Grok 1.x session config options", async () => {
+    const { model, child } = fixtureModel(
+      "config-options-1x.jsonl",
+      false,
+      [],
+      "grok-4.5",
+    );
+    const result = await model.doGenerate(
+      promptOptions("ping", { reasoning: "low" }),
+    );
+    const configRequests = child.requests.filter(
+      (request) =>
+        "method" in request && request.method === "session/set_config_option",
+    );
+    expect(configRequests).toHaveLength(2);
+    expect(configRequests).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          params: expect.objectContaining({
+            configId: "model",
+            value: "grok-4.5",
+          }),
+        }),
+        expect.objectContaining({
+          params: expect.objectContaining({
+            configId: "reasoning_effort",
+            value: "low",
+          }),
+        }),
+      ]),
+    );
+    expect(result.providerMetadata?.["grok-build"]).toMatchObject({
+      sessionId: "session-config-1x",
+      resolvedModel: "grok-4.5",
+      currentReasoningEffort: "low",
+      supportedReasoningEfforts: ["low", "high"],
+      agentVersion: "1.0.34",
+    });
+  });
+
+  it("rejects malformed session model catalogs with redacted protocol data", async () => {
+    const { model, child } = fixtureModel("text-only.jsonl", false, [
+      "session/new",
+    ]);
+    const pending = model.doStream(promptOptions("ping"));
+    await vi.waitFor(() => {
+      expect(
+        child.requests.some(
+          (message) => "method" in message && message.method === "session/new",
+        ),
+      ).toBe(true);
+    });
+    const request = child.requests.find(
+      (message) => "method" in message && message.method === "session/new",
+    ) as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      id: request.id,
+      result: {
+        sessionId: "session-malformed-models",
+        models: {
+          currentModelId: "grok-4.5",
+          availableModels: [
+            { modelId: "", name: "Invalid", apiKey: "wire-secret" },
+          ],
+        },
+      },
+    });
+
+    const error = await pending.catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(APICallError);
+    expect(error).toMatchObject({
+      isRetryable: false,
+      data: { code: "PROTOCOL_ERROR" },
+      cause: expect.any(AcpProtocolError),
+    });
+    const cause = (error as { cause: AcpProtocolError }).cause;
+    expect(JSON.stringify(cause.data)).not.toContain("wire-secret");
+    expect(JSON.stringify(cause.data)).toContain("[REDACTED]");
+  });
+
+  it("rejects malformed session config-option collections", async () => {
+    const { model, child } = fixtureModel("text-only.jsonl", false, [
+      "session/new",
+    ]);
+    const pending = model.doStream(promptOptions("ping"));
+    await vi.waitFor(() => {
+      expect(
+        child.requests.some(
+          (message) => "method" in message && message.method === "session/new",
+        ),
+      ).toBe(true);
+    });
+    const request = child.requests.find(
+      (message) => "method" in message && message.method === "session/new",
+    ) as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      id: request.id,
+      result: {
+        sessionId: "session-malformed-config",
+        configOptions: { id: "model" },
+      },
+    });
+
+    await expect(pending).rejects.toMatchObject({
+      cause: expect.any(AcpProtocolError),
+      data: { code: "PROTOCOL_ERROR" },
+    });
+  });
+
+  it("rejects malformed set_config_option responses", async () => {
+    const { model, child } = fixtureModel("config-options-1x.jsonl", false, [
+      "session/set_config_option",
+    ]);
+    const pending = model.doStream(promptOptions("ping"));
+    await vi.waitFor(() => {
+      expect(
+        child.requests.some(
+          (message) =>
+            "method" in message &&
+            message.method === "session/set_config_option",
+        ),
+      ).toBe(true);
+    });
+    const request = child.requests.find(
+      (message) =>
+        "method" in message && message.method === "session/set_config_option",
+    ) as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      id: request.id,
+      result: {
+        configOptions: [
+          {
+            id: "model",
+            type: "select",
+            currentValue: "grok-4.5",
+            options: [{ value: 42 }],
+          },
+        ],
+      },
+    });
+
+    await expect(pending).rejects.toMatchObject({
+      cause: expect.any(AcpProtocolError),
+      data: { code: "PROTOCOL_ERROR" },
+    });
+  });
+
   it.each([
     { unknown: true },
     { reasoningEffort: "extreme" },
-    { permissionMode: "acceptEdits" },
+    { permissionMode: "unattended" },
     { maxTurns: 0 },
     { session: { id: "one", resume: "two" } },
     {

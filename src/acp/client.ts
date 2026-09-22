@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import { isAbsolute } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { Readable, Writable } from "node:stream";
+import { abortError, waitAbortably } from "../abort.js";
 import {
   AcpAuthenticationError,
   AcpError,
@@ -31,6 +32,8 @@ import type {
   AcpRequestPermissionParams,
   AcpRequestPermissionResult,
   AcpSessionResult,
+  AcpSetConfigOptionParams,
+  AcpSetConfigOptionResult,
   AcpSessionUpdateParams,
   AcpStopReason,
   AcpWriteTextFileParams,
@@ -48,8 +51,15 @@ const DEFAULT_STDERR_LIMIT = 32_768;
 const CANCEL_GRACE_MS = 250;
 const TERMINATE_GRACE_MS = 500;
 const KILL_GRACE_MS = 250;
+const ACP_ABORT_MESSAGE = "The ACP operation was aborted.";
 
-export type PermissionMode = "default" | "bypassPermissions";
+export type PermissionMode =
+  | "default"
+  | "acceptEdits"
+  | "auto"
+  | "dontAsk"
+  | "bypassPermissions"
+  | "plan";
 
 export interface AcpChildProcess {
   stdin: Writable;
@@ -100,8 +110,12 @@ export interface AcpClientOptions {
   cwd?: string;
   requestTimeoutMs?: number;
   stderrLimit?: number;
+  cancelGraceMs?: number;
+  terminateGraceMs?: number;
+  killGraceMs?: number;
   authMethod?: string | false;
   permissionMode?: PermissionMode;
+  alwaysApprove?: boolean;
   onPermissionRequest?: PermissionHandler;
   fileSystem?: AcpFileSystemSettings;
   onUpdate?: (update: AcpSessionUpdateParams) => void | Promise<void>;
@@ -109,6 +123,27 @@ export interface AcpClientOptions {
     notification: AcpExtensionNotification,
   ) => void | Promise<void>;
   spawn?: AcpSpawnFactory;
+}
+
+/** @internal Effective process and callback settings shared by the client pool. */
+export interface ResolvedAcpClientOptions {
+  executable: string;
+  args: readonly string[];
+  env: NodeJS.ProcessEnv;
+  cwd?: string;
+  requestTimeoutMs: number;
+  stderrLimit: number;
+  cancelGraceMs: number;
+  terminateGraceMs: number;
+  killGraceMs: number;
+  authMethod: string | false;
+  permissionMode: PermissionMode;
+  alwaysApprove: boolean;
+  onPermissionRequest?: PermissionHandler;
+  fileSystem: AcpFileSystemSettings;
+  onUpdate?: AcpClientOptions["onUpdate"];
+  onExtension?: AcpClientOptions["onExtension"];
+  spawn: AcpSpawnFactory;
 }
 
 export interface AcpPromptOptions {
@@ -189,11 +224,33 @@ function defaultSpawn(
   return spawn(executable, [...args], options);
 }
 
-function abortReason(signal: AbortSignal): Error {
-  if (signal.reason instanceof Error) return signal.reason;
-  const error = new Error("The ACP operation was aborted.");
-  error.name = "AbortError";
-  return error;
+/** @internal Resolve defaults once so construction and pooling cannot drift. */
+export function resolveAcpClientOptions(
+  options: AcpClientOptions = {},
+): ResolvedAcpClientOptions {
+  return {
+    executable: options.executable ?? "grok",
+    args: options.args ?? DEFAULT_ARGS,
+    env: { ...process.env, ...options.env },
+    cwd: options.cwd,
+    requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+    stderrLimit: Math.max(0, options.stderrLimit ?? DEFAULT_STDERR_LIMIT),
+    cancelGraceMs: Math.max(0, options.cancelGraceMs ?? CANCEL_GRACE_MS),
+    terminateGraceMs: Math.max(
+      0,
+      options.terminateGraceMs ?? TERMINATE_GRACE_MS,
+    ),
+    killGraceMs: Math.max(0, options.killGraceMs ?? KILL_GRACE_MS),
+    authMethod:
+      options.authMethod === undefined ? "cached_token" : options.authMethod,
+    permissionMode: options.permissionMode ?? "default",
+    alwaysApprove: options.alwaysApprove ?? false,
+    onPermissionRequest: options.onPermissionRequest,
+    fileSystem: options.fileSystem ?? {},
+    onUpdate: options.onUpdate,
+    onExtension: options.onExtension,
+    spawn: options.spawn ?? defaultSpawn,
+  };
 }
 
 function errorMessage(error: unknown): string {
@@ -213,12 +270,18 @@ export class AcpClient {
   private readonly cwd?: string;
   private readonly requestTimeoutMs: number;
   private readonly stderrLimit: number;
+  private readonly cancelGraceMs: number;
+  private readonly terminateGraceMs: number;
+  private readonly killGraceMs: number;
   private readonly authMethod: string | false;
   private readonly permissionMode: PermissionMode;
   private readonly onPermissionRequest?: PermissionHandler;
+  private readonly alwaysApprove: boolean;
   private readonly fileSystem: AcpFileSystemSettings;
   private readonly onUpdate?: AcpClientOptions["onUpdate"];
-  private readonly onExtension?: AcpClientOptions["onExtension"];
+  private readonly extensionHandlers = new Set<
+    NonNullable<AcpClientOptions["onExtension"]>
+  >();
   private readonly spawnProcess: AcpSpawnFactory;
 
   private child?: AcpChildProcess;
@@ -234,7 +297,9 @@ export class AcpClient {
     Set<(update: AcpSessionUpdateParams) => void | Promise<void>>
   >();
   private readonly activeSessions = new Set<string>();
+  private readonly sessionQueues = new Map<string, Promise<void>>();
   private readonly pendingPermissions = new Map<JsonRpcId, PendingPermission>();
+  private readonly agentRequestTasks = new Set<Promise<void>>();
   private writeQueue: Promise<void> = Promise.resolve();
   private readQueue: Promise<void> = Promise.resolve();
   private initializePromise?: Promise<AcpInitializeResult>;
@@ -248,23 +313,27 @@ export class AcpClient {
   private shutdownRequested = false;
   private cancellationRequested = false;
   private disposePromise?: Promise<void>;
+  private activeLeases = 0;
 
   constructor(options: AcpClientOptions = {}) {
-    this.executable = options.executable ?? "grok";
-    this.args = options.args ?? DEFAULT_ARGS;
-    this.env = { ...process.env, ...options.env };
-    this.cwd = options.cwd;
-    this.requestTimeoutMs =
-      options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
-    this.stderrLimit = Math.max(0, options.stderrLimit ?? DEFAULT_STDERR_LIMIT);
-    this.authMethod =
-      options.authMethod === undefined ? "cached_token" : options.authMethod;
-    this.permissionMode = options.permissionMode ?? "default";
-    this.onPermissionRequest = options.onPermissionRequest;
-    this.fileSystem = options.fileSystem ?? {};
-    this.onUpdate = options.onUpdate;
-    this.onExtension = options.onExtension;
-    this.spawnProcess = options.spawn ?? defaultSpawn;
+    const resolved = resolveAcpClientOptions(options);
+    this.executable = resolved.executable;
+    this.args = resolved.args;
+    this.env = resolved.env;
+    this.cwd = resolved.cwd;
+    this.requestTimeoutMs = resolved.requestTimeoutMs;
+    this.stderrLimit = resolved.stderrLimit;
+    this.cancelGraceMs = resolved.cancelGraceMs;
+    this.terminateGraceMs = resolved.terminateGraceMs;
+    this.killGraceMs = resolved.killGraceMs;
+    this.authMethod = resolved.authMethod;
+    this.permissionMode = resolved.permissionMode;
+    this.onPermissionRequest = resolved.onPermissionRequest;
+    this.alwaysApprove = resolved.alwaysApprove;
+    this.fileSystem = resolved.fileSystem;
+    this.onUpdate = resolved.onUpdate;
+    if (resolved.onExtension) this.extensionHandlers.add(resolved.onExtension);
+    this.spawnProcess = resolved.spawn;
   }
 
   get capabilities(): AcpInitializeResult | undefined {
@@ -279,6 +348,57 @@ export class AcpClient {
     return this.lastFailure;
   }
 
+  get isUsable(): boolean {
+    return (
+      !this.shutdownRequested &&
+      !this.childExited &&
+      this.state !== "disposed" &&
+      this.state !== "exited"
+    );
+  }
+
+  get isIdle(): boolean {
+    return (
+      this.isUsable &&
+      this.activeLeases === 0 &&
+      this.initializePromise === undefined &&
+      this.pending.size === 0 &&
+      this.activeSessions.size === 0 &&
+      this.sessionQueues.size === 0 &&
+      this.pendingPermissions.size === 0 &&
+      this.agentRequestTasks.size === 0
+    );
+  }
+
+  /**
+   * Hold this client across a multi-request operation such as one generation.
+   * This is primarily intended for integrations that pool AcpClient instances.
+   */
+  acquireLease(): () => void {
+    if (!this.isUsable) {
+      throw (
+        this.lastFailure ??
+        new AcpError("Cannot lease an exited or disposed AcpClient.", {
+          code: "CLIENT_DISPOSED",
+        })
+      );
+    }
+    this.activeLeases++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.activeLeases = Math.max(0, this.activeLeases - 1);
+    };
+  }
+
+  registerExtensionHandler(
+    handler: NonNullable<AcpClientOptions["onExtension"]>,
+  ): () => void {
+    this.extensionHandlers.add(handler);
+    return () => this.extensionHandlers.delete(handler);
+  }
+
   registerRequestHandler<Method extends keyof AcpAgentRequestMap>(
     method: Method,
     handler: RequestHandler<Method>,
@@ -291,11 +411,25 @@ export class AcpClient {
   }
 
   async initialize(signal?: AbortSignal): Promise<AcpInitializeResult> {
-    if (signal?.aborted) throw abortReason(signal);
+    if (signal?.aborted) throw abortError(signal, ACP_ABORT_MESSAGE);
+    if (!this.isUsable) {
+      throw (
+        this.lastFailure ??
+        new AcpError("Cannot initialize an exited or disposed AcpClient.", {
+          code: "CLIENT_DISPOSED",
+        })
+      );
+    }
     if (this.initialized) return this.initialized;
-    if (this.initializePromise) return await this.initializePromise;
+    if (this.initializePromise) {
+      return await waitAbortably(
+        this.initializePromise,
+        signal,
+        ACP_ABORT_MESSAGE,
+      );
+    }
 
-    this.initializePromise = this.initializeInternal(signal)
+    this.initializePromise = this.initializeInternal()
       .catch((error: unknown) => {
         this.fail(error);
         throw error;
@@ -303,7 +437,11 @@ export class AcpClient {
       .finally(() => {
         this.initializePromise = undefined;
       });
-    return await this.initializePromise;
+    return await waitAbortably(
+      this.initializePromise,
+      signal,
+      ACP_ABORT_MESSAGE,
+    );
   }
 
   async authenticate(
@@ -357,7 +495,7 @@ export class AcpClient {
     signal?: AbortSignal,
   ): Promise<void> {
     await this.initialize(signal);
-    if (signal?.aborted) throw abortReason(signal);
+    if (signal?.aborted) throw abortError(signal, ACP_ABORT_MESSAGE);
     await this.writeMessage({ jsonrpc: "2.0", method, params });
   }
 
@@ -395,10 +533,32 @@ export class AcpClient {
         },
       );
     }
-    return await this.requestSessionWithAuthenticationRetry(
-      "session/load",
-      params,
+    return await this.enqueueSessionOperation(
+      params.sessionId,
       signal,
+      async () =>
+        await this.requestSessionWithAuthenticationRetry(
+          "session/load",
+          params,
+          signal,
+        ),
+    );
+  }
+
+  async setConfigOption(
+    params: AcpSetConfigOptionParams,
+    signal?: AbortSignal,
+  ): Promise<AcpSetConfigOptionResult> {
+    return await this.enqueueSessionOperation(
+      params.sessionId,
+      signal,
+      async () =>
+        await this.request(
+          "session/set_config_option",
+          params,
+          this.requestTimeoutMs,
+          signal,
+        ),
     );
   }
 
@@ -406,9 +566,45 @@ export class AcpClient {
     params: AcpPromptParams,
     options: AcpPromptOptions = {},
   ): Promise<AcpPromptOutcome> {
+    return await this.enqueueSessionOperation(
+      params.sessionId,
+      options.signal,
+      async () => await this.promptInternal(params, options),
+    );
+  }
+
+  private async enqueueSessionOperation<T>(
+    sessionId: string,
+    signal: AbortSignal | undefined,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.sessionQueues.get(sessionId);
+    const queued = (previous ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(async () => {
+        if (signal?.aborted) throw abortError(signal, ACP_ABORT_MESSAGE);
+        return await operation();
+      });
+    const tail = queued.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.sessionQueues.set(sessionId, tail);
+    void tail.finally(() => {
+      if (this.sessionQueues.get(sessionId) === tail) {
+        this.sessionQueues.delete(sessionId);
+      }
+    });
+    return await waitAbortably(queued, signal, ACP_ABORT_MESSAGE);
+  }
+
+  private async promptInternal(
+    params: AcpPromptParams,
+    options: AcpPromptOptions,
+  ): Promise<AcpPromptOutcome> {
     await this.initialize(options.signal);
     const signal = options.signal;
-    if (signal?.aborted) throw abortReason(signal);
+    if (signal?.aborted) throw abortError(signal, ACP_ABORT_MESSAGE);
 
     const handler = options.onUpdate;
     this.activeSessions.add(params.sessionId);
@@ -418,11 +614,6 @@ export class AcpClient {
       this.promptHandlers.set(params.sessionId, handlers);
     }
 
-    const onAbort = (): void => {
-      void this.cancelSession(params.sessionId).catch(() => undefined);
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-
     try {
       const result = await this.requestInternal(
         "session/prompt",
@@ -431,9 +622,17 @@ export class AcpClient {
         signal,
       );
       return { stopReason: result.stopReason, meta: result._meta };
+    } catch (error) {
+      if (
+        error instanceof AcpTimeoutError ||
+        signal?.aborted ||
+        (error instanceof Error && error.name === "AbortError")
+      ) {
+        await this.cancelSession(params.sessionId).catch(() => undefined);
+      }
+      throw error;
     } finally {
       this.activeSessions.delete(params.sessionId);
-      signal?.removeEventListener("abort", onAbort);
       if (handler) {
         const handlers = this.promptHandlers.get(params.sessionId);
         handlers?.delete(handler);
@@ -459,9 +658,7 @@ export class AcpClient {
     await this.dispose();
   }
 
-  private async initializeInternal(
-    signal?: AbortSignal,
-  ): Promise<AcpInitializeResult> {
+  private async initializeInternal(): Promise<AcpInitializeResult> {
     this.start();
     const result = await this.requestInternal(
       "initialize",
@@ -482,7 +679,7 @@ export class AcpClient {
         },
       },
       this.requestTimeoutMs,
-      signal,
+      undefined,
     );
 
     if (result.protocolVersion !== 1) {
@@ -560,17 +757,17 @@ export class AcpClient {
         (sessionIds.length > 0 || this.cancellationRequested) &&
         !this.childExited
       ) {
-        await this.waitForExit(CANCEL_GRACE_MS);
+        await this.waitForExit(this.cancelGraceMs);
       }
     }
 
     if (!this.childExited) {
       this.child?.kill("SIGTERM");
-      await this.waitForExit(TERMINATE_GRACE_MS);
+      await this.waitForExit(this.terminateGraceMs);
     }
     if (!this.childExited) {
       this.child?.kill("SIGKILL");
-      await this.waitForExit(KILL_GRACE_MS);
+      await this.waitForExit(this.killGraceMs);
     }
 
     this.state = "disposed";
@@ -597,9 +794,9 @@ export class AcpClient {
   private async terminateAfterFailure(): Promise<void> {
     if (this.childExited || !this.child) return;
     this.child.kill("SIGTERM");
-    if (!(await this.waitForExit(TERMINATE_GRACE_MS))) {
+    if (!(await this.waitForExit(this.terminateGraceMs))) {
       this.child.kill("SIGKILL");
-      await this.waitForExit(KILL_GRACE_MS);
+      await this.waitForExit(this.killGraceMs);
     }
   }
 
@@ -709,7 +906,8 @@ export class AcpClient {
     signal?: AbortSignal,
   ): Promise<AcpRequestMap[Method]["result"]> {
     this.start();
-    if (signal?.aborted) return Promise.reject(abortReason(signal));
+    if (signal?.aborted)
+      return Promise.reject(abortError(signal, ACP_ABORT_MESSAGE));
     const id = this.nextId++;
 
     return new Promise<AcpRequestMap[Method]["result"]>((resolve, reject) => {
@@ -726,7 +924,7 @@ export class AcpClient {
         clearTimeout(pending.timer);
         this.pending.delete(id);
         pending.cleanup();
-        reject(abortReason(signal as AbortSignal));
+        reject(abortError(signal as AbortSignal, ACP_ABORT_MESSAGE));
       };
       signal?.addEventListener("abort", onAbort, { once: true });
 
@@ -807,7 +1005,7 @@ export class AcpClient {
       );
     }
     if ("id" in record) {
-      await this.handleAgentRequest(record as unknown as JsonRpcRequest);
+      this.dispatchAgentRequest(record as unknown as JsonRpcRequest);
       return;
     }
     await this.handleNotification(
@@ -847,11 +1045,15 @@ export class AcpClient {
       await this.invokeSafely(this.onUpdate, params);
       const handlers = this.promptHandlers.get(params.sessionId);
       if (handlers) {
-        for (const handler of handlers) await handler(params);
+        for (const handler of handlers) {
+          await this.invokeSafely(handler, params);
+        }
       }
       return;
     }
-    await this.invokeSafely(this.onExtension, notification);
+    for (const handler of this.extensionHandlers) {
+      await this.invokeSafely(handler, notification);
+    }
   }
 
   private async invokeSafely<T>(
@@ -866,8 +1068,17 @@ export class AcpClient {
     }
   }
 
+  private dispatchAgentRequest(request: JsonRpcRequest): void {
+    const task = this.handleAgentRequest(request);
+    this.agentRequestTasks.add(task);
+    void task
+      .catch((error: unknown) => this.fail(error))
+      .finally(() => this.agentRequestTasks.delete(task));
+  }
+
   private async handleAgentRequest(request: JsonRpcRequest): Promise<void> {
     const customHandler = this.requestHandlers.get(request.method);
+    let response: object;
     try {
       let result: unknown;
       if (customHandler) {
@@ -893,14 +1104,14 @@ export class AcpClient {
           },
         );
       }
-      await this.writeMessage({
+      response = {
         jsonrpc: "2.0",
         id: request.id,
         result: result ?? null,
-      });
+      };
     } catch (error) {
       const protocolError = error instanceof AcpError ? error : undefined;
-      await this.writeMessage({
+      response = {
         jsonrpc: "2.0",
         id: request.id,
         error: {
@@ -912,8 +1123,9 @@ export class AcpClient {
                 : -32603,
           message: errorMessage(error),
         },
-      });
+      };
     }
+    await this.writeMessage(response);
   }
 
   private async handlePermissionRequest(
@@ -931,7 +1143,7 @@ export class AcpClient {
         ? Promise.resolve(this.onPermissionRequest(request)).then((result) =>
             this.validatePermissionResult(request, result),
           )
-        : this.permissionMode === "bypassPermissions"
+        : this.permissionMode === "bypassPermissions" || this.alwaysApprove
           ? Promise.resolve(this.selectAllowOption(request))
           : Promise.reject(this.defaultPermissionError(request));
       return await Promise.race([decision, cancelled]);
@@ -972,7 +1184,7 @@ export class AcpClient {
     request: AcpRequestPermissionParams,
   ): AcpPermissionError {
     return new AcpPermissionError(
-      `Grok requested permission for tool call '${request.toolCall.toolCallId}', but permissionMode is 'default' and no onPermissionRequest callback is configured. Options: ${this.describePermissionOptions(request)}.`,
+      `Grok requested permission for tool call '${request.toolCall.toolCallId}', but permissionMode is '${this.permissionMode}' and no onPermissionRequest callback is configured. Options: ${this.describePermissionOptions(request)}.`,
     );
   }
 

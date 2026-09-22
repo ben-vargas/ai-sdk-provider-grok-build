@@ -15,6 +15,11 @@ export interface MappedGrokBuildPrompt {
   warnings: SharedV4Warning[];
 }
 
+export interface MappedGrokExecPrompt {
+  prompt: string;
+  warnings: SharedV4Warning[];
+}
+
 function unsupported(feature: string, details: string): SharedV4Warning {
   return { type: "unsupported", feature, details };
 }
@@ -101,7 +106,7 @@ async function mapFilePart(
     warnings.push(
       unsupported(
         `${topLevelType} input`,
-        `Grok Build 0.2.99 ACP advertises ${topLevelType}: false; the file was omitted.`,
+        `This provider does not accept ${topLevelType} content through this input mapping; the file was omitted.`,
       ),
     );
     return undefined;
@@ -320,6 +325,36 @@ export async function mapGrokBuildPrompt(
   return { prompt: blocks, warnings };
 }
 
+/** Serialize roles and completed tool history into a headless-safe transcript. */
+export async function mapGrokExecPrompt(
+  prompt: LanguageModelV4Prompt,
+  responseFormat?: LanguageModelV4CallOptions["responseFormat"],
+): Promise<MappedGrokExecPrompt> {
+  const mapped = await mapGrokBuildPrompt(prompt);
+  const transcript = mapped.prompt
+    .map((block) => {
+      if (block.type === "text") return block.text;
+      if (block.type === "resource" && "text" in block.resource) {
+        return `\n[FILE ${block.resource.uri}]\n${block.resource.text}\n[/FILE]\n`;
+      }
+      return "";
+    })
+    .join("");
+  if (responseFormat?.type !== "json" || responseFormat.schema) {
+    return { prompt: transcript, warnings: mapped.warnings };
+  }
+  return {
+    prompt: `${transcript}\n[OUTPUT FORMAT]\nReturn only valid JSON with no Markdown fences.${responseFormat.name ? ` Output name: ${responseFormat.name}.` : ""}${responseFormat.description ? ` ${responseFormat.description}` : ""}\n[/OUTPUT FORMAT]\n`,
+    warnings: [
+      ...mapped.warnings,
+      compatibility(
+        "schema-less JSON responseFormat",
+        "Grok schema-less JSON output uses prompt guidance and is not constrained decoding.",
+      ),
+    ],
+  };
+}
+
 export function mapGrokBuildCallWarnings(
   options: LanguageModelV4CallOptions,
 ): SharedV4Warning[] {
@@ -374,6 +409,66 @@ export function mapGrokBuildCallWarnings(
       unsupported(
         "toolChoice",
         `ACP cannot enforce toolChoice '${options.toolChoice.type}'; it was ignored.`,
+      ),
+    );
+  }
+  return warnings;
+}
+
+export function mapGrokExecCallWarnings(
+  options: LanguageModelV4CallOptions,
+): SharedV4Warning[] {
+  const warnings: SharedV4Warning[] = [];
+  const unsupportedSettings: Array<
+    [keyof LanguageModelV4CallOptions, unknown]
+  > = [
+    ["maxOutputTokens", options.maxOutputTokens],
+    ["temperature", options.temperature],
+    ["topP", options.topP],
+    ["topK", options.topK],
+    ["presencePenalty", options.presencePenalty],
+    ["frequencyPenalty", options.frequencyPenalty],
+    ["seed", options.seed],
+  ];
+  for (const [feature, value] of unsupportedSettings) {
+    if (value !== undefined) {
+      warnings.push(
+        unsupported(
+          feature,
+          `Grok CLI headless mode exposes no ${feature} flag; the setting was ignored.`,
+        ),
+      );
+    }
+  }
+  if (options.stopSequences?.length) {
+    warnings.push(
+      unsupported(
+        "stopSequences",
+        "Grok CLI headless mode exposes no stop-sequence flag; the setting was ignored.",
+      ),
+    );
+  }
+  if (hasCallerHeaders(options.headers)) {
+    warnings.push(
+      unsupported(
+        "headers",
+        "Grok CLI headless mode exposes no request-header input; the headers were ignored.",
+      ),
+    );
+  }
+  if (options.tools?.length) {
+    warnings.push(
+      unsupported(
+        "tools",
+        "AI SDK tool definitions cannot be registered with the Grok CLI. Grok's provider-executed runtime tools remain available.",
+      ),
+    );
+  }
+  if (options.toolChoice && options.toolChoice.type !== "auto") {
+    warnings.push(
+      unsupported(
+        "toolChoice",
+        `Grok CLI cannot enforce AI SDK toolChoice '${options.toolChoice.type}'; it was ignored.`,
       ),
     );
   }

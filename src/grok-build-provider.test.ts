@@ -28,5 +28,9 @@ describe("createGrokBuild", () => {
         timeouts: { requestMs: 0 },
       }),
     ).toThrow();
+    expect(() => grokBuild.languageModel("   ")).toThrow(NoSuchModelError);
+    expect(() => Reflect.construct(grokBuild as never, [])).toThrow(
+      "new keyword",
+    );
   });
 });

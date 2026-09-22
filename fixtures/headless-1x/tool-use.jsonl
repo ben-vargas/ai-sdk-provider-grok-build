@@ -1,0 +1,5 @@
+{"type":"thought","data":"I will inspect the file."}
+{"type":"tool_call","toolCallId":"call-1","toolName":"Read","title":"Read README.md","rawInput":{"file_path":"README.md"}}
+{"type":"tool_call_update","toolCallId":"call-1","status":"completed","rawOutput":{"text":"# Grok Build Provider"}}
+{"type":"text","data":"I read the file."}
+{"type":"end","stopReason":"EndTurn","sessionId":"00000000-0000-4000-8000-000000000102","requestId":"req-tool","usage":{"input_tokens":11,"output_tokens":6,"reasoning_tokens":5}}

@@ -1,0 +1,2 @@
+{"type":"text","data":"partial"}
+{"type":"end","stopReason":"cancelled","sessionId":"00000000-0000-4000-8000-000000000104","requestId":"req-cancelled","usage":{"input_tokens":4,"output_tokens":1}}

@@ -1,4 +1,4 @@
-/** ACP protocol v1 wire types used by Grok Build 0.2.99. */
+/** ACP protocol v1 wire types used by Grok CLI 1.x. */
 
 export type JsonRpcId = string | number;
 export type JsonValue =
@@ -311,8 +311,38 @@ export interface AcpSessionResult {
   sessionId: string;
   models?: AcpModelState;
   modes?: AcpMeta;
-  configOptions?: JsonValue[];
+  configOptions?: AcpConfigOption[];
   _meta?: AcpSessionResultMeta | null;
+}
+
+export interface AcpConfigSelectChoice {
+  value: string;
+  name?: string;
+  description?: string;
+  _meta?: AcpMeta | null;
+}
+
+export interface AcpConfigOption {
+  id: string;
+  name?: string;
+  description?: string;
+  category?: string;
+  type: "select" | (string & {});
+  currentValue?: string;
+  options?: AcpConfigSelectChoice[];
+  _meta?: AcpMeta | null;
+}
+
+export interface AcpSetConfigOptionParams {
+  sessionId: string;
+  configId: string;
+  value: string;
+  _meta?: AcpMeta | null;
+}
+
+export interface AcpSetConfigOptionResult {
+  configOptions: AcpConfigOption[];
+  _meta?: AcpMeta | null;
 }
 
 /** Stable ACP session/load returns an empty result after replay; Grok may add session state. */
@@ -617,6 +647,10 @@ export interface AcpRequestMap {
     result: AcpLoadSessionResult;
   };
   "session/prompt": { params: AcpPromptParams; result: AcpPromptResult };
+  "session/set_config_option": {
+    params: AcpSetConfigOptionParams;
+    result: AcpSetConfigOptionResult;
+  };
 }
 
 export interface AcpNotificationMap {

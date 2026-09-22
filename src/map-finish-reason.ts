@@ -6,7 +6,11 @@ export function mapGrokBuildFinishReason(
 ): LanguageModelV4FinishReason {
   const normalized = stopReason.toLowerCase();
   let unified: LanguageModelV4FinishReason["unified"];
-  if (normalized === "end_turn" || normalized === "stop") {
+  if (
+    normalized === "end_turn" ||
+    normalized === "endturn" ||
+    normalized === "stop"
+  ) {
     unified = "stop";
   } else if (
     normalized === "max_tokens" ||

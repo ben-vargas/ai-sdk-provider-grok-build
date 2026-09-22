@@ -10,7 +10,22 @@ export default defineConfig({
       provider: "v8",
       reportsDirectory: "./coverage",
       reporter: ["text", "html"],
-      exclude: ["dist/**", "vitest.config.ts", "tsup.config.ts"],
+      include: ["src/**/*.ts"],
+      exclude: [
+        "src/**/*.test.ts",
+        "src/acp/protocol.ts",
+        "src/acp/protocol-types.ts",
+        "src/acp/spawn.ts",
+        "src/types.ts",
+        "src/language-model.ts",
+        "src/provider.ts",
+      ],
+      thresholds: {
+        statements: 80,
+        branches: 80,
+        functions: 80,
+        lines: 80,
+      },
     },
   },
 });

@@ -1,0 +1,115 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  createGrokAgent,
+  createGrokExec,
+  ensureGrokCliVersion,
+  resolveGrokCommand,
+} from "../dist/index.js";
+
+if (process.env.CI) {
+  throw new Error(
+    "test:live is an authenticated local smoke test and must not run in CI.",
+  );
+}
+
+function callOptions(text) {
+  return {
+    prompt: [{ role: "user", content: [{ type: "text", text }] }],
+  };
+}
+
+function generatedText(result) {
+  return result.content
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .join("");
+}
+
+function assertSentinel(result, sentinel, mode) {
+  const text = generatedText(result);
+  if (!text.includes(sentinel)) {
+    throw new Error(
+      `${mode} smoke test did not return ${sentinel}; received ${JSON.stringify(text)}.`,
+    );
+  }
+}
+
+function assertHeadlessUsage(usage) {
+  const { total, noCache, cacheRead, cacheWrite } = usage.inputTokens;
+  if (typeof total !== "number" || total < 0) {
+    throw new Error("Headless smoke test did not return a valid input total.");
+  }
+  const components = [noCache, cacheRead, cacheWrite].filter(
+    (value) => typeof value === "number",
+  );
+  if (
+    components.length > 0 &&
+    components.reduce((sum, value) => sum + value, 0) !== total
+  ) {
+    throw new Error(
+      `Headless usage is inconsistent: total=${String(total)}, components=${components.join("+")}.`,
+    );
+  }
+}
+
+const directory = await mkdtemp(join(tmpdir(), "grok-provider-live-"));
+let agent;
+
+try {
+  const command = await resolveGrokCommand({ cwd: directory });
+  const version = await ensureGrokCliVersion(command, { cwd: directory });
+  console.log(`Verified Grok CLI ${version} (${command.command}).`);
+
+  const exec = createGrokExec({
+    defaultSettings: {
+      cwd: directory,
+      noSubagents: true,
+      webSearch: false,
+      timeouts: { promptMs: 120_000 },
+    },
+  });
+  const execResult = await exec().doGenerate(
+    callOptions("Reply with exactly GROK_EXEC_LIVE_OK and nothing else."),
+  );
+  assertSentinel(execResult, "GROK_EXEC_LIVE_OK", "grokExec");
+  assertHeadlessUsage(execResult.usage);
+  console.log("grokExec generation and native usage invariants passed.");
+
+  await exec().doGenerate(
+    callOptions(
+      "Use the shell tool once to run pwd, then briefly report whether the tool was allowed. Do not ask the user a question.",
+    ),
+  );
+  console.log(
+    "grokExec permission-requiring prompt terminated under implicit dontAsk mode.",
+  );
+
+  agent = createGrokAgent({
+    defaultSettings: {
+      cwd: directory,
+      timeouts: { promptMs: 120_000 },
+    },
+  });
+  const acpResult = await agent().doGenerate(
+    callOptions("Reply with exactly GROK_ACP_LIVE_OK and nothing else."),
+  );
+  assertSentinel(acpResult, "GROK_ACP_LIVE_OK", "pooled ACP");
+  console.log("Pooled ACP generation passed.");
+} catch (error) {
+  throw new Error(
+    `Live Grok smoke test failed. Confirm that Grok CLI >=1.0.0 is installed and authenticated with \`grok login\`. ${
+      error instanceof Error ? error.message : String(error)
+    }`,
+    { cause: error },
+  );
+} finally {
+  try {
+    await agent?.close();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+console.log("Authenticated Grok live smoke test passed.");

@@ -17,8 +17,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Grok ACP 0.2.99 has no verified model setter. A bad requested model can
-  // therefore complete with the runtime model and a model-selection warning.
+  // Grok 1.x advertises valid choices before the provider calls the setter. A
+  // bad ID can therefore warn and retain the advertised current model.
   const modelWarnings = (result.warnings ?? []).filter(
     (warning) => warning.feature === "model selection",
   );
@@ -28,7 +28,9 @@ async function main(): Promise<void> {
     );
   }
 
-  console.log("Request used the runtime model instead of the bad model ID.");
+  console.log(
+    "Grok did not select the unavailable model and retained its advertised current model.",
+  );
   console.log("Expected model-selection warnings:", modelWarnings);
 }
 

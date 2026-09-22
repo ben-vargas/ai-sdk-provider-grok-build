@@ -1,0 +1,1 @@
+{"text":"{\"value\":\"fixture@example.com\"}","stopReason":"EndTurn","sessionId":"00000000-0000-4000-8000-000000000103","requestId":"req-structured","usage":{"input_tokens":9,"output_tokens":3},"num_turns":1,"modelUsage":{"grok-4.5-build":{"inputTokens":9,"outputTokens":3,"modelCalls":1}},"structuredOutput":{"value":"fixture@example.com"}}

@@ -1,31 +1,30 @@
 # Examples
 
-Build the provider, then run any example against the locally authenticated Grok CLI:
+Build the provider, then run an example against an authenticated Grok CLI 1.x:
 
 ```sh
 npm run build
 npx tsx examples/basic-generate-text.ts
 ```
 
-The default authentication method is `cached_token`, which reuses the login stored by the
-Grok CLI. Run `grok login` first if needed. `XAI_API_KEY` is supported separately by creating
-a provider with `authMethod: "api_key"`.
+Prompts are intentionally small. Examples that invoke tools can modify the selected `cwd`; inspect their prompt and permission settings before running them.
 
-| Example                  | Demonstrates                                                  |
-| ------------------------ | ------------------------------------------------------------- |
-| `basic-generate-text.ts` | `generateText` and the returned ACP session ID                |
-| `streaming.ts`           | visible reasoning and answer deltas                           |
-| `tool-activity.ts`       | provider-executed tool calls and results                      |
-| `session-continuity.ts`  | resuming an ACP session ID for a second call                  |
-| `abort-signal.ts`        | cancelling a stream with `AbortSignal`                        |
-| `error-handling.ts`      | handling a bad requested model ID                             |
-| `usage-and-cost.ts`      | AI SDK usage, per-model ACP usage, and cost availability      |
-| `provider-options.ts`    | call-level option syntax and reasoning compatibility warnings |
+| Example                     | Demonstrates                                 |
+| --------------------------- | -------------------------------------------- |
+| `basic-generate-text.ts`    | Compatible per-call `grokBuild` generation   |
+| `streaming.ts`              | Reasoning and answer deltas                  |
+| `tool-activity.ts`          | Provider-executed tool calls/results         |
+| `session-continuity.ts`     | ACP `session/load` continuity                |
+| `pooled-agent.ts`           | Persistent `grokAgent` and required teardown |
+| `model-and-effort.ts`       | Session-scoped model/effort selection        |
+| `exec-structured-output.ts` | Native schema output with `Output.object()`  |
+| `exec-session-resume.ts`    | Headless resume/fork session flags           |
+| `exec-flags.ts`             | Sandbox, tools, rules, and permission flags  |
+| `exec-cancellation.ts`      | Headless abort and child cleanup             |
+| `binary-resolution.ts`      | Explicit, trusted-package, and `npx` paths   |
+| `abort-signal.ts`           | ACP cancellation                             |
+| `provider-options.ts`       | Strict `"grok-build"` call options           |
+| `usage-and-cost.ts`         | Usage and provider metadata                  |
+| `error-handling.ts`         | Typed provider/CLI errors                    |
 
-Prompts are intentionally small. `tool-activity.ts` permits provider-executed tools without an
-interactive approval prompt and asks Grok to perform one read-only terminal operation.
-`provider-options.ts` deliberately requests a reasoning effort that may differ from the
-runtime value so it can label and display the resulting compatibility warning.
-`error-handling.ts` likewise demonstrates a model-selection warning when the runtime falls
-back instead of rejecting the invalid ID. `session-continuity.ts` labels the compatibility
-warning that accompanies every explicit session load.
+Every transport passes `permissionMode` explicitly. The examples enable broader permissions only where their prompt needs them. `grokAgent` examples always use `try/finally` so the provider pool is closed.

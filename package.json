@@ -1,7 +1,7 @@
 {
   "name": "ai-sdk-provider-grok-build",
-  "version": "1.0.0",
-  "description": "AI SDK v7 provider for the xAI Grok Build CLI over ACP",
+  "version": "1.1.0",
+  "description": "AI SDK v7 providers for the xAI Grok CLI over ACP and headless execution",
   "keywords": [
     "ai-sdk",
     "grok-build",
@@ -49,9 +49,13 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "test": "vitest run --configLoader runner",
+    "test:live": "npm run build && node scripts/live-smoke.mjs",
     "test:watch": "vitest --configLoader runner",
     "test:coverage": "vitest run --coverage --configLoader runner",
-    "validate": "npm run build && npm run typecheck && npm run format && npm run lint && npm run test"
+    "validate": "npm run build && npm run typecheck && npm run format && npm run lint && npm run test",
+    "validate:docs": "node scripts/validate-docs.mjs",
+    "validate:package": "npm pack --dry-run && node scripts/import-smoke.mjs",
+    "validate:full": "npm run validate && npm run validate:docs && npm run validate:package"
   },
   "dependencies": {
     "@ai-sdk/provider": "^4.0.2",

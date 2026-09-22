@@ -9,7 +9,9 @@ import { redactSensitiveData } from "./redact.js";
 
 export interface NormalizedUsage {
   inputTotal?: number;
+  inputNoCache?: number;
   cacheRead?: number;
+  cacheWrite?: number;
   outputTotal?: number;
   reasoning?: number;
   raw?: JsonValue;

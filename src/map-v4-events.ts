@@ -89,7 +89,7 @@ export class GrokBuildV4StreamEmitter {
     }
   }
 
-  private emitNormalized(events: NormalizedEvent[]): void {
+  emitNormalized(events: NormalizedEvent[]): void {
     for (const event of events) {
       switch (event.kind) {
         case "text-start":

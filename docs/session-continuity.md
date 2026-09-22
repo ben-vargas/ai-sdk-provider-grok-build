@@ -1,82 +1,62 @@
 # Session continuity
 
-Grok Build ACP returns a session ID for each new session. The provider places that ID in final provider metadata so a later model call can load the same Grok session.
+Every terminal finish exposes a request-local session ID under `providerMetadata["grok-build"].sessionId`. Persist it only after a call finishes successfully.
 
-Persist the ID only after the call reaches its final step. An aborted or failed call may not produce terminal provider metadata.
+## ACP sessions
 
-## Continue an explicit session
+`grokBuild` and `grokAgent` load an explicit ID with ACP `session/load`:
 
-```typescript
+```ts
 import { generateText } from "ai";
-import { grokBuild } from "ai-sdk-provider-grok-build";
+import { createGrokAgent } from "ai-sdk-provider-grok-build";
 
-const first = await generateText({
-  model: grokBuild(),
-  prompt: "Review the project and remember the two highest-risk files.",
+const agent = createGrokAgent();
+try {
+  const first = await generateText({
+    model: agent("grok-4.6"),
+    prompt: "Remember the word marigold.",
+  });
+  const sessionId = first.finalStep.providerMetadata?.["grok-build"]?.sessionId;
+  if (typeof sessionId !== "string") throw new Error("Missing session ID");
+
+  await generateText({
+    model: agent("grok-4.6"),
+    prompt: "What word did I ask you to remember?",
+    providerOptions: { "grok-build": { session: { id: sessionId } } },
+  });
+} finally {
+  await agent.close();
+}
+```
+
+`grokBuild` starts a fresh process for the second call and asks Grok to replay the stored session. `grokAgent` may reuse its provider-local client. Prompts targeting the same session are serialized; prompts for different sessions may run concurrently.
+
+ACP has no verified most-recent-session lookup or fork operation. `continue` and `fork` therefore warn and create a new session. Use an explicit ID for ACP continuity.
+
+## Headless sessions
+
+`grokExec` maps Grok 1.x session flags directly:
+
+```ts
+import { grokExec } from "ai-sdk-provider-grok-build";
+
+const resumed = grokExec("grok-4.6", {
+  session: { resume: previousSessionId },
 });
 
-const sessionId = first.finalStep.providerMetadata?.["grok-build"]?.sessionId;
-if (typeof sessionId !== "string") {
-  throw new Error("Missing Grok Build session ID");
-}
-
-const second = await generateText({
-  model: grokBuild(),
-  prompt: "Explain the first risk in more detail.",
-  providerOptions: {
-    "grok-build": {
-      session: { id: sessionId },
-    },
+const forked = grokExec("grok-4.6", {
+  session: {
+    resume: previousSessionId,
+    fork: true,
+    id: "00000000-0000-4000-8000-000000000001",
   },
 });
 ```
 
-`session.resume` accepts the same explicit ID and currently has the same load behavior. `session.id` and `session.resume` are mutually exclusive.
+Validation matches the CLI:
 
-The provider does not keep an ACP process alive between these calls. The second call starts a new process and asks Grok to load the stored ID.
+- `resume` and `continue` cannot both be set;
+- `fork` requires `resume` or `continue`;
+- `id` creates a new session, or names the new fork when combined with resume/continue and fork.
 
-## Working directory and MCP servers
-
-Each call starts a new `grok agent stdio` process. Loading a session sends the current resolved `cwd` and merged MCP server list with `session/load`:
-
-```typescript
-import { createGrokBuild } from "ai-sdk-provider-grok-build";
-
-const provider = createGrokBuild({
-  cwd: "/absolute/path/to/project",
-  mcpServers: [],
-});
-```
-
-Keep `cwd` and MCP configuration stable across calls. Cross-directory session loading and replay with changed MCP servers are not fixture-verified.
-
-## Unsupported shortcuts
-
-`session.continue: true` does not search for the most recent session. ACP exposes no verified most-recent-session lookup, so the provider warns and creates a new session unless an explicit ID is also supplied.
-
-`session.fork: true` does not clone a session. ACP does not advertise a fork operation. The provider warns and creates a new session rather than loading or mutating the supplied source session.
-
-## Current verification boundary
-
-Real fixture captures prove `session/new`, returned session IDs, and restart replay through `session/load`. After the original ACP process exits, a new process loads the explicit session ID, receives the prior user and assistant chunks before the load response, and successfully recalls that context in a follow-up prompt. Coverage also verifies that an explicit ID selects `session/load` instead of `session/new`. It does not yet establish:
-
-- behavior for missing, expired, or malformed IDs;
-- cross-`cwd` loading;
-- concurrent prompts against one session;
-- whether every xAI extension event is replayed;
-- fork or most-recent-session lookup semantics.
-
-For that reason, every session load includes an AI SDK compatibility warning. Treat explicit continuity as an available but still compatibility-sensitive path, and store enough application state to recover by starting a fresh session if loading fails.
-
-A practical recovery policy is to retain the user-visible transcript separately, attempt the explicit load once, and start a new session with a concise text summary if Grok rejects or cannot replay the ID. Replaying the entire AI SDK history is not equivalent to loading the ACP session, as described below.
-
-## Fresh-session history is not native continuity
-
-Passing prior AI SDK messages into a new call is different from loading the ACP session. ACP `session/prompt` has no arbitrary role-history import field. The provider therefore:
-
-- wraps system, user, assistant, and tool history in labeled transcript text;
-- omits private reasoning history with a warning;
-- reduces tool calls/results and approval responses to textual audit markers;
-- does not recreate provider-executed tool identity or live permission state.
-
-Use an explicit ACP session ID when real Grok session continuity matters.
+Keep `cwd` stable when relying on most-recent sessions or title-based resume. Invalid, expired, ambiguous, and cross-directory session behavior is reported by Grok. Retain an application-level transcript or summary so a failed load can recover with a new session.

@@ -7,6 +7,7 @@ import { AcpSpawnError } from "./errors.js";
 import type {
   AcpSessionUpdateParams,
   AcpMessageChunkUpdate,
+  AcpRequestPermissionResult,
   AcpToolCallProgressUpdate,
   AcpToolCallUpdate,
   JsonRpcRequest,
@@ -500,6 +501,225 @@ describe("AcpClient fixture replay", () => {
     await client.dispose();
   });
 
+  it("isolates an aborted caller from the shared initialization handshake", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "initialize",
+    ]);
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    const controller = new AbortController();
+    const first = client.initialize(controller.signal);
+    const second = client.initialize();
+    await new Promise((resolve) => setImmediate(resolve));
+    const request = child.requests.find(
+      (message) => "method" in message && message.method === "initialize",
+    ) as JsonRpcRequest;
+    controller.abort();
+    await expect(first).rejects.toMatchObject({ name: "AbortError" });
+    const result = readFixture("text-only.jsonl").find(
+      (row) =>
+        row.dir === "in" &&
+        isRecord(row.msg) &&
+        "result" in row.msg &&
+        isRecord(row.msg.result) &&
+        row.msg.result.protocolVersion === 1,
+    );
+    expect(result).toBeDefined();
+    child.send({ ...(result?.msg as object), id: request.id });
+    await expect(second).resolves.toMatchObject({ protocolVersion: 1 });
+    expect(child.killSignals).toEqual([]);
+    await client.dispose();
+  });
+
+  it("rejects an aborted queued prompt immediately while retaining queue order", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/prompt",
+    ]);
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    const session = await client.newSession({
+      cwd: "/fixture",
+      mcpServers: [],
+    });
+    const params = (text: string) => ({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text" as const, text }],
+    });
+    const first = client.prompt(params("first"));
+    const controller = new AbortController();
+    const second = client.prompt(params("second"), {
+      signal: controller.signal,
+    });
+    const third = client.prompt(params("third"));
+    await new Promise((resolve) => setImmediate(resolve));
+    controller.abort();
+    await expect(second).rejects.toMatchObject({ name: "AbortError" });
+    let promptRequests = child.requests.filter(
+      (message) => "method" in message && message.method === "session/prompt",
+    ) as JsonRpcRequest[];
+    expect(promptRequests).toHaveLength(1);
+    child.send({
+      jsonrpc: "2.0",
+      id: promptRequests[0]?.id,
+      result: { stopReason: "end_turn" },
+    });
+    await expect(first).resolves.toMatchObject({ stopReason: "end_turn" });
+    await new Promise((resolve) => setImmediate(resolve));
+    promptRequests = child.requests.filter(
+      (message) => "method" in message && message.method === "session/prompt",
+    ) as JsonRpcRequest[];
+    expect(promptRequests).toHaveLength(2);
+    child.send({
+      jsonrpc: "2.0",
+      id: promptRequests[1]?.id,
+      result: { stopReason: "end_turn" },
+    });
+    await expect(third).resolves.toMatchObject({ stopReason: "end_turn" });
+    await client.dispose();
+  });
+
+  it("sends session/cancel before releasing a timed-out prompt", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/prompt",
+    ]);
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    const session = await client.newSession({
+      cwd: "/fixture",
+      mcpServers: [],
+    });
+    await expect(
+      client.prompt(
+        {
+          sessionId: session.sessionId,
+          prompt: [{ type: "text", text: "wait" }],
+        },
+        { timeoutMs: 5 },
+      ),
+    ).rejects.toMatchObject({ name: "AcpTimeoutError" });
+    expect(child.requests).toContainEqual({
+      jsonrpc: "2.0",
+      method: "session/cancel",
+      params: { sessionId: session.sessionId },
+    });
+    await client.dispose();
+  });
+
+  it("serializes session/load behind a prompt for the same session", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/prompt",
+    ]);
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    await client.initialize();
+    const prompt = client.prompt({
+      sessionId: "existing-session",
+      prompt: [{ type: "text", text: "wait" }],
+    });
+    const load = client.loadSession({
+      sessionId: "existing-session",
+      cwd: "/fixture",
+      mcpServers: [],
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(
+      child.requests.some(
+        (message) => "method" in message && message.method === "session/load",
+      ),
+    ).toBe(false);
+    const promptRequest = child.requests.find(
+      (message) => "method" in message && message.method === "session/prompt",
+    ) as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      id: promptRequest.id,
+      result: { stopReason: "end_turn" },
+    });
+    await expect(prompt).resolves.toMatchObject({ stopReason: "end_turn" });
+    await expect(load).resolves.toBeNull();
+    await client.dispose();
+  });
+
+  it("serializes session configuration behind a prompt for the same session", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/prompt",
+      "session/set_config_option",
+    ]);
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    await client.initialize();
+    const prompt = client.prompt({
+      sessionId: "existing-session",
+      prompt: [{ type: "text", text: "wait" }],
+    });
+    const configuration = client.setConfigOption({
+      sessionId: "existing-session",
+      configId: "model",
+      value: "grok-4.5",
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(
+      child.requests.some(
+        (message) =>
+          "method" in message && message.method === "session/set_config_option",
+      ),
+    ).toBe(false);
+
+    const promptRequest = child.requests.find(
+      (message) => "method" in message && message.method === "session/prompt",
+    ) as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      id: promptRequest.id,
+      result: { stopReason: "end_turn" },
+    });
+    await prompt;
+    await new Promise((resolve) => setImmediate(resolve));
+    const configRequest = child.requests.find(
+      (message) =>
+        "method" in message && message.method === "session/set_config_option",
+    ) as JsonRpcRequest;
+    child.send({
+      jsonrpc: "2.0",
+      id: configRequest.id,
+      result: { configOptions: [] },
+    });
+    await expect(configuration).resolves.toEqual({ configOptions: [] });
+    await client.dispose();
+  });
+
+  it("keeps a client non-idle until its generation lease is released", () => {
+    const client = new AcpClient();
+    const release = client.acquireLease();
+    expect(client.isIdle).toBe(false);
+    release();
+    release();
+    expect(client.isIdle).toBe(true);
+  });
+
+  it("allows prompts for different sessions to run concurrently", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/prompt",
+    ]);
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    await client.initialize();
+    const prompts = ["one", "two"].map((sessionId) =>
+      client.prompt({
+        sessionId,
+        prompt: [{ type: "text", text: sessionId }],
+      }),
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    const requests = child.requests.filter(
+      (message) => "method" in message && message.method === "session/prompt",
+    ) as JsonRpcRequest[];
+    expect(requests).toHaveLength(2);
+    for (const request of requests) {
+      child.send({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { stopReason: "end_turn" },
+      });
+    }
+    await expect(Promise.all(prompts)).resolves.toHaveLength(2);
+    await client.dispose();
+  });
+
   it("capability-gates and sends the documented session/load request", async () => {
     const child = new FixtureChild(readFixture("text-only.jsonl"));
     const client = new AcpClient({ authMethod: false, spawn: () => child });
@@ -787,6 +1007,90 @@ describe("AcpClient failures", () => {
 });
 
 describe("AcpClient agent requests", () => {
+  it("continues reading other sessions while a permission decision is pending", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/prompt",
+    ]);
+    let decidePermission!: (result: AcpRequestPermissionResult) => void;
+    const updates: string[] = [];
+    const client = new AcpClient({
+      authMethod: false,
+      spawn: () => child,
+      onPermissionRequest: () =>
+        new Promise<AcpRequestPermissionResult>((resolve) => {
+          decidePermission = resolve;
+        }),
+    });
+    await client.initialize();
+    const prompt = client.prompt(
+      {
+        sessionId: "session-b",
+        prompt: [{ type: "text", text: "continue" }],
+      },
+      {
+        onUpdate: ({ update }) => {
+          updates.push(update.sessionUpdate);
+        },
+      },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    const promptRequest = child.requests.find(
+      (message) => "method" in message && message.method === "session/prompt",
+    ) as JsonRpcRequest;
+
+    child.send({
+      jsonrpc: "2.0",
+      id: "permission-pending",
+      method: "session/request_permission",
+      params: {
+        sessionId: "session-a",
+        toolCall: { sessionUpdate: "tool_call_update", toolCallId: "call-a" },
+        options: [
+          { optionId: "allow", name: "Allow once", kind: "allow_once" },
+        ],
+      },
+    });
+    child.send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "session-b",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "still moving" },
+        },
+      },
+    });
+    child.send({
+      jsonrpc: "2.0",
+      id: promptRequest.id,
+      result: { stopReason: "end_turn" },
+    });
+
+    await expect(prompt).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(updates).toEqual(["agent_message_chunk"]);
+    expect(
+      child.requests.some(
+        (message) =>
+          !("method" in message) && message.id === "permission-pending",
+      ),
+    ).toBe(false);
+    expect(client.isIdle).toBe(false);
+
+    decidePermission({
+      outcome: { outcome: "selected", optionId: "allow" },
+    });
+    await vi.waitFor(() =>
+      expect(child.requests).toContainEqual({
+        jsonrpc: "2.0",
+        id: "permission-pending",
+        result: { outcome: { outcome: "selected", optionId: "allow" } },
+      }),
+    );
+    await vi.waitFor(() => expect(client.isIdle).toBe(true));
+    await client.dispose();
+  });
+
   it("selects an allow option only in bypassPermissions mode", async () => {
     const child = new FixtureChild(readFixture("text-only.jsonl"));
     const client = new AcpClient({
@@ -817,6 +1121,35 @@ describe("AcpClient agent requests", () => {
     // Responses are written to child.stdin and recorded by the same fake transport.
     expect(response).toMatchObject({
       id: "permission-1",
+      result: { outcome: { outcome: "selected", optionId: "allow" } },
+    });
+    await client.dispose();
+  });
+
+  it("selects an allow option when alwaysApprove is explicitly enabled", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"));
+    const client = new AcpClient({
+      authMethod: false,
+      alwaysApprove: true,
+      spawn: () => child,
+    });
+    await client.initialize();
+    child.send({
+      jsonrpc: "2.0",
+      id: "permission-always",
+      method: "session/request_permission",
+      params: {
+        sessionId: "session-1",
+        toolCall: { sessionUpdate: "tool_call_update", toolCallId: "call-1" },
+        options: [
+          { optionId: "allow", name: "Allow once", kind: "allow_once" },
+        ],
+      },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(child.requests).toContainEqual({
+      jsonrpc: "2.0",
+      id: "permission-always",
       result: { outcome: { outcome: "selected", optionId: "allow" } },
     });
     await client.dispose();
@@ -901,5 +1234,147 @@ describe("AcpClient agent requests", () => {
     await expect(client.initialize()).rejects.toThrow(
       "ensure 'grok' is on PATH",
     );
+  });
+});
+
+describe("AcpClient prompt concurrency", () => {
+  it("serializes prompts for one session", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/prompt",
+    ]);
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    const session = await client.newSession({
+      cwd: "/fixture",
+      mcpServers: [],
+    });
+    const first = client.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "first" }],
+    });
+    const second = client.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "second" }],
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    let prompts = child.requests.filter(
+      (message) => "method" in message && message.method === "session/prompt",
+    ) as JsonRpcRequest[];
+    expect(prompts).toHaveLength(1);
+    child.send({
+      jsonrpc: "2.0",
+      id: prompts[0]?.id,
+      result: { stopReason: "end_turn" },
+    });
+    await first;
+    await new Promise((resolve) => setImmediate(resolve));
+    prompts = child.requests.filter(
+      (message) => "method" in message && message.method === "session/prompt",
+    ) as JsonRpcRequest[];
+    expect(prompts).toHaveLength(2);
+    child.send({
+      jsonrpc: "2.0",
+      id: prompts[1]?.id,
+      result: { stopReason: "end_turn" },
+    });
+    await second;
+    await client.dispose();
+  });
+
+  it("allows prompts on different sessions concurrently", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/prompt",
+    ]);
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    await client.initialize();
+    const first = client.prompt({
+      sessionId: "session-a",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    const second = client.prompt({
+      sessionId: "session-b",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    const prompts = child.requests.filter(
+      (message) => "method" in message && message.method === "session/prompt",
+    ) as JsonRpcRequest[];
+    expect(prompts).toHaveLength(2);
+    for (const prompt of prompts) {
+      child.send({
+        jsonrpc: "2.0",
+        id: prompt.id,
+        result: { stopReason: "end_turn" },
+      });
+    }
+    await Promise.all([first, second]);
+    await client.dispose();
+  });
+
+  it("keeps per-prompt update callback failures isolated", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/prompt",
+    ]);
+    const client = new AcpClient({ authMethod: false, spawn: () => child });
+    await client.initialize();
+    const healthyUpdates: string[] = [];
+    const failedHandler = client.prompt(
+      {
+        sessionId: "session-failed-handler",
+        prompt: [{ type: "text", text: "first" }],
+      },
+      {
+        onUpdate: () => {
+          throw new Error("consumer callback failed");
+        },
+      },
+    );
+    const healthy = client.prompt(
+      {
+        sessionId: "session-healthy-handler",
+        prompt: [{ type: "text", text: "second" }],
+      },
+      {
+        onUpdate: ({ update }) => {
+          healthyUpdates.push(update.sessionUpdate);
+        },
+      },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    const prompts = child.requests.filter(
+      (message) => "method" in message && message.method === "session/prompt",
+    ) as JsonRpcRequest[];
+    for (const sessionId of [
+      "session-failed-handler",
+      "session-healthy-handler",
+    ]) {
+      child.send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: sessionId },
+          },
+        },
+      });
+      const prompt = prompts.find(
+        (request) =>
+          isRecord(request.params) && request.params.sessionId === sessionId,
+      );
+      child.send({
+        jsonrpc: "2.0",
+        id: prompt?.id,
+        result: { stopReason: "end_turn" },
+      });
+    }
+
+    await expect(Promise.all([failedHandler, healthy])).resolves.toHaveLength(
+      2,
+    );
+    expect(healthyUpdates).toEqual(["agent_message_chunk"]);
+    expect(client.failure).toBeUndefined();
+    expect(client.isUsable).toBe(true);
+    await client.dispose();
   });
 });

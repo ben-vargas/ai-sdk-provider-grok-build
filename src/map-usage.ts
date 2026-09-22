@@ -15,9 +15,9 @@ export function mapGrokBuildUsage(
   return {
     inputTokens: {
       total: usage.inputTotal,
-      noCache: undefined,
+      noCache: usage.inputNoCache,
       cacheRead: usage.cacheRead,
-      cacheWrite: undefined,
+      cacheWrite: usage.cacheWrite,
     },
     outputTokens: {
       total: usage.outputTotal,

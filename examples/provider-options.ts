@@ -10,7 +10,7 @@ console.log("Provider default: permissionMode=default");
 console.log(
   "Configured call overrides: reasoningEffort=low, permissionMode=bypassPermissions",
 );
-console.log("Reasoning: an expected compatibility warning may follow.");
+console.log("Model and reasoning are selected through ACP session config.");
 
 const result = await generateText({
   model: grok(),
@@ -29,17 +29,5 @@ if (response !== "options received") {
     `Expected "options received", received ${JSON.stringify(response)}.`,
   );
 }
-const unexpectedWarnings = (result.warnings ?? []).filter(
-  (warning) => warning.feature !== "reasoning",
-);
-if (unexpectedWarnings.length > 0) {
-  throw new Error(
-    `Received unexpected warnings: ${JSON.stringify(unexpectedWarnings)}`,
-  );
-}
-
 console.log("Response:", response);
-console.log(
-  "Expected reasoning warnings:",
-  result.warnings?.length ? result.warnings : "none (runtime already uses low)",
-);
+console.log("Warnings:", result.warnings?.length ? result.warnings : "none");

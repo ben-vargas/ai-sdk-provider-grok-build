@@ -1,0 +1,4 @@
+{"type":"thought","data":"Checking the request."}
+{"type":"text","data":"Hello from Grok."}
+{"type":"usage","usage":{"input_tokens":7,"output_tokens":4,"cache_read_input_tokens":1}}
+{"type":"end","stopReason":"EndTurn","sessionId":"00000000-0000-4000-8000-000000000101","requestId":"req-text","usage":{"input_tokens":7,"output_tokens":4,"cache_read_input_tokens":1}}
