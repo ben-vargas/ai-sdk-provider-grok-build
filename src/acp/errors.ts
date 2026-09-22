@@ -1,4 +1,10 @@
 import type { JsonRpcErrorObject, JsonValue } from "./protocol.js";
+import { redactSensitiveData } from "../redact.js";
+import {
+  ACP_AUTHENTICATION_REQUIRED_CODE,
+  JSON_RPC_INTERNAL_ERROR_CODE,
+  isLegacyGrokAuthenticationRpcFailure,
+} from "./authentication.js";
 
 export interface AcpErrorOptions {
   code?: string;
@@ -17,24 +23,69 @@ export function stripAnsiEscapeSequences(raw: string): string {
   return raw.replace(ANSI_ESCAPE_SEQUENCE, "");
 }
 
-export function stderrTail(raw: string): string {
-  const lines = stripAnsiEscapeSequences(raw)
+const MAX_PUBLIC_DIAGNOSTIC_CODE_POINTS = 600;
+const MAX_PUBLIC_DIAGNOSTIC_LINES = 5;
+
+function sanitizedDiagnosticLines(raw: string): string[] {
+  const normalized = stripAnsiEscapeSequences(raw)
     .split(/\r\n|\r|\n|\u2028|\u2029/)
     .map((line) =>
       Array.from(line)
         .filter((character) => {
           const codePoint = character.codePointAt(0) ?? 0;
-          return codePoint >= 0x20 && codePoint !== 0x7f;
+          return (
+            codePoint >= 0x20 &&
+            codePoint !== 0x7f &&
+            (codePoint < 0x80 || codePoint > 0x9f)
+          );
         })
         .join("")
         .trim(),
-    )
-    .filter(Boolean)
-    .slice(-5)
+    );
+  const redacted = redactSensitiveData(normalized.join("\n"));
+  return (typeof redacted === "string" ? redacted : "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function limitDiagnosticStart(raw: string): string {
+  const codePoints = Array.from(raw);
+  return codePoints.length > MAX_PUBLIC_DIAGNOSTIC_CODE_POINTS
+    ? `${codePoints.slice(0, MAX_PUBLIC_DIAGNOSTIC_CODE_POINTS - 1).join("")}…`
+    : raw;
+}
+
+/** Sanitizes an agent-provided diagnostic while retaining its leading context. */
+export function sanitizeDiagnosticMessage(raw: string): string {
+  return limitDiagnosticStart(
+    sanitizedDiagnosticLines(raw)
+      .slice(0, MAX_PUBLIC_DIAGNOSTIC_LINES)
+      .join("; "),
+  );
+}
+
+function sanitizeStderr(raw: string): string {
+  const hasTrailingLineBreak = /(?:\r\n|\r|\n|\u2028|\u2029)$/.test(raw);
+  const lines = sanitizedDiagnosticLines(raw).slice(
+    -MAX_PUBLIC_DIAGNOSTIC_LINES,
+  );
+  const value = `${lines.join("\n")}${
+    hasTrailingLineBreak && lines.length > 0 ? "\n" : ""
+  }`;
+  const codePoints = Array.from(value);
+  return codePoints.length > MAX_PUBLIC_DIAGNOSTIC_CODE_POINTS
+    ? `…${codePoints.slice(-(MAX_PUBLIC_DIAGNOSTIC_CODE_POINTS - 1)).join("")}`
+    : value;
+}
+
+export function stderrTail(raw: string): string {
+  const lines = sanitizedDiagnosticLines(raw)
+    .slice(-MAX_PUBLIC_DIAGNOSTIC_LINES)
     .join("; ");
   const codePoints = Array.from(lines);
-  return codePoints.length > 600
-    ? `…${codePoints.slice(-599).join("")}`
+  return codePoints.length > MAX_PUBLIC_DIAGNOSTIC_CODE_POINTS
+    ? `…${codePoints.slice(-(MAX_PUBLIC_DIAGNOSTIC_CODE_POINTS - 1)).join("")}`
     : lines;
 }
 
@@ -49,7 +100,10 @@ export class AcpError extends Error {
     super(message, { cause: options.cause });
     this.name = "AcpError";
     this.code = options.code;
-    this.stderr = options.stderr;
+    const sanitizedStderr = options.stderr
+      ? sanitizeStderr(options.stderr)
+      : "";
+    this.stderr = sanitizedStderr || undefined;
     this.exitCode = options.exitCode;
     this.signal = options.signal;
     this.data = options.data;
@@ -58,7 +112,7 @@ export class AcpError extends Error {
 
 export class AcpAuthenticationError extends AcpError {
   constructor(message: string, options: AcpErrorOptions = {}) {
-    super(message, {
+    super(sanitizeDiagnosticMessage(message), {
       ...options,
       code: options.code ?? "AUTHENTICATION_FAILED",
     });
@@ -90,30 +144,28 @@ export class AcpJsonRpcError extends AcpProtocolError {
     error: JsonRpcErrorObject,
     options: AcpErrorOptions = {},
   ) {
-    super(`ACP request '${method}' failed (${error.code}): ${error.message}`, {
+    const rpcMessage = sanitizeDiagnosticMessage(error.message);
+    super(`ACP request '${method}' failed (${error.code}): ${rpcMessage}`, {
       ...options,
       code: "JSON_RPC_ERROR",
-      data: error.data,
+      data: redactSensitiveData(error.data),
     });
     this.name = "AcpJsonRpcError";
     this.rpcCode = error.code;
-    this.rpcMessage = error.message;
+    this.rpcMessage = rpcMessage;
     this.method = method;
   }
 }
 
-const AUTHENTICATION_RPC_DIAGNOSTIC =
-  /\b(?:token|credential)\s+refresh\s+failed\b|\b(?:authentication|login)\s+(?:is\s+)?required\b|\bunauthorized\b|\bunauthenticated\b|\b(?:invalid|expired)\s+(?:access\s+)?token\b/i;
-
-/** @internal Classify only explicit ACP authentication failures. */
+/** @internal Classify canonical ACP auth errors and bounded legacy Grok auth failures. */
 export function isAcpAuthenticationRpcError(
   error: unknown,
 ): error is AcpJsonRpcError {
   return (
     error instanceof AcpJsonRpcError &&
-    (error.rpcCode === -32000 ||
-      (error.rpcCode === -32603 &&
-        AUTHENTICATION_RPC_DIAGNOSTIC.test(error.rpcMessage)))
+    (error.rpcCode === ACP_AUTHENTICATION_REQUIRED_CODE ||
+      (error.rpcCode === JSON_RPC_INTERNAL_ERROR_CODE &&
+        isLegacyGrokAuthenticationRpcFailure(error.method, error.rpcMessage)))
   );
 }
 

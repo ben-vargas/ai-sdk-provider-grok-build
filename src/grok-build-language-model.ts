@@ -178,6 +178,10 @@ function throwIfAborted(signal: AbortSignal): void {
   throw abortError(signal, "The Grok Build call was aborted.");
 }
 
+function effectiveAuthenticationMode(settings: GrokBuildSettings): string {
+  return settings.authMethod ?? (settings.apiKey ? "api_key" : "cached_token");
+}
+
 export class GrokBuildLanguageModel implements LanguageModelV4 {
   readonly specificationVersion = "v4" as const;
   readonly provider = "grok-build";
@@ -334,7 +338,13 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
       prepared = await this.prepareCall(options, abortController.signal);
     } catch (error) {
       options.abortSignal?.removeEventListener("abort", forwardAbort);
-      throw mapAcpError(error, { modelId: this.modelId });
+      throw mapAcpError(
+        error,
+        { modelId: this.modelId },
+        {
+          authenticationMode: effectiveAuthenticationMode(this.settings),
+        },
+      );
     }
 
     const stream = new ReadableStream<LanguageModelV4StreamPart>({
@@ -398,7 +408,12 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
               mapAcpError(
                 error,
                 { modelId: this.modelId },
-                { postDispatch: true },
+                {
+                  authenticationMode: effectiveAuthenticationMode(
+                    this.settings,
+                  ),
+                  postDispatch: true,
+                },
               ),
             );
           })
@@ -474,9 +489,7 @@ export class GrokBuildLanguageModel implements LanguageModelV4 {
     const includeExtensionEvents = Boolean(
       providerOptions?.includeExtensionEvents,
     );
-    const authMethod =
-      this.settings.authMethod ??
-      (this.settings.apiKey ? "api_key" : "cached_token");
+    const authMethod = effectiveAuthenticationMode(this.settings);
     const env = {
       ...this.settings.env,
       ...(this.settings.apiKey ? { XAI_API_KEY: this.settings.apiKey } : {}),

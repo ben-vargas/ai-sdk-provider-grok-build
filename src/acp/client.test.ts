@@ -284,6 +284,269 @@ describe("AcpClient fixture replay", () => {
     await client.dispose();
   });
 
+  it.each(["session/new", "session/load"] as const)(
+    "authenticates and retries %s once after a legacy token-refresh failure",
+    async (method) => {
+      const child = new FixtureChild(readFixture("text-only.jsonl"), [method]);
+      const client = new AcpClient({ spawn: () => child });
+      const requestsForMethod = (): JsonRpcRequest[] =>
+        child.requests.filter(
+          (request): request is JsonRpcRequest =>
+            "method" in request && "id" in request && request.method === method,
+        );
+      const waitForRequest = async (index: number): Promise<JsonRpcRequest> => {
+        await vi.waitFor(() =>
+          expect(requestsForMethod()).toHaveLength(index + 1),
+        );
+        const request = requestsForMethod()[index];
+        expect(request).toBeDefined();
+        if (!request) {
+          throw new Error(`Expected request ${index + 1} for ${method}.`);
+        }
+        return request;
+      };
+
+      try {
+        const pending =
+          method === "session/new"
+            ? client.newSession({ cwd: "/fixture", mcpServers: [] })
+            : client.loadSession({
+                sessionId: "existing-session",
+                cwd: "/fixture",
+                mcpServers: [],
+              });
+        const firstRequest = await waitForRequest(0);
+        child.send({
+          jsonrpc: "2.0",
+          id: firstRequest.id,
+          error: { code: -32603, message: "token refresh failed" },
+        });
+
+        const retriedRequest = await waitForRequest(1);
+        child.send({
+          jsonrpc: "2.0",
+          id: retriedRequest.id,
+          result:
+            method === "session/new" ? { sessionId: "retried-session" } : null,
+        });
+
+        await expect(pending).resolves.toEqual(
+          method === "session/new" ? { sessionId: "retried-session" } : null,
+        );
+        expect(
+          child.requests
+            .filter((request) => "method" in request)
+            .map((request) => request.method),
+        ).toEqual(["initialize", method, "authenticate", method]);
+      } finally {
+        await client.dispose();
+      }
+    },
+  );
+
+  it.each(["session/new", "session/load"] as const)(
+    "preserves the original %s auth failure when Grok advertises no authentication methods",
+    async (method) => {
+      const child = new FixtureChild(readFixture("config-options-1x.jsonl"), [
+        method,
+      ]);
+      const client = new AcpClient({ spawn: () => child });
+
+      try {
+        const pending =
+          method === "session/new"
+            ? client.newSession({ cwd: "/fixture", mcpServers: [] })
+            : client.loadSession({
+                sessionId: "existing-session",
+                cwd: "/fixture",
+                mcpServers: [],
+              });
+        void pending.catch(() => undefined);
+        await vi.waitFor(() => {
+          expect(
+            child.requests.filter(
+              (request) => "method" in request && request.method === method,
+            ),
+          ).toHaveLength(1);
+        });
+        const request = child.requests.find(
+          (message): message is JsonRpcRequest =>
+            "method" in message && "id" in message && message.method === method,
+        );
+        expect(request).toBeDefined();
+        if (!request) throw new Error(`Expected a ${method} request.`);
+        child.send({
+          jsonrpc: "2.0",
+          id: request.id,
+          error: { code: -32603, message: "token refresh failed" },
+        });
+
+        const error = await pending.catch((value: unknown) => value);
+        expect(error).toMatchObject(
+          method === "session/new"
+            ? {
+                name: "AcpAuthenticationError",
+                code: "AUTHENTICATION_FAILED",
+                cause: {
+                  name: "AcpJsonRpcError",
+                  code: "JSON_RPC_ERROR",
+                  rpcCode: -32603,
+                  rpcMessage: "token refresh failed",
+                  method,
+                },
+              }
+            : {
+                name: "AcpJsonRpcError",
+                code: "JSON_RPC_ERROR",
+                rpcCode: -32603,
+                rpcMessage: "token refresh failed",
+                method,
+              },
+        );
+        expect(error).toBeInstanceOf(Error);
+        if (error instanceof Error) {
+          expect(error.message).toContain(method);
+          expect(error.message).toContain("-32603");
+          expect(error.message).toContain("token refresh failed");
+          expect(error.message).not.toContain("grok login");
+          expect(error.message).not.toContain("apiKey");
+        }
+        expect(
+          child.requests
+            .filter((message) => "method" in message)
+            .map((message) => message.method),
+        ).toEqual(["initialize", method]);
+      } finally {
+        await client.dispose();
+      }
+    },
+  );
+
+  it.each(["session/new", "session/load"] as const)(
+    "reports an unavailable configured method before retrying %s",
+    async (method) => {
+      const child = new FixtureChild(readFixture("text-only.jsonl"), [method]);
+      const client = new AcpClient({
+        authMethod: "cached-token",
+        spawn: () => child,
+      });
+      try {
+        const pending =
+          method === "session/new"
+            ? client.newSession({ cwd: "/fixture", mcpServers: [] })
+            : client.loadSession({
+                sessionId: "existing-session",
+                cwd: "/fixture",
+                mcpServers: [],
+              });
+        void pending.catch(() => undefined);
+        await vi.waitFor(() => {
+          expect(
+            child.requests.filter(
+              (request) => "method" in request && request.method === method,
+            ),
+          ).toHaveLength(1);
+        });
+        const request = child.requests.find(
+          (message): message is JsonRpcRequest =>
+            "method" in message && "id" in message && message.method === method,
+        );
+        if (!request) throw new Error(`Expected a ${method} request.`);
+        child.stderr.write(
+          "unrelated Authorization: Bearer sk-unrelated-request\n",
+        );
+        child.send({
+          jsonrpc: "2.0",
+          id: request.id,
+          error: { code: -32000, message: "Authentication required" },
+        });
+
+        const error = await pending.catch((value: unknown) => value);
+        expect(error).toMatchObject({
+          name: "AcpAuthenticationError",
+          code: "AUTH_METHOD_NOT_AVAILABLE",
+          stderr: undefined,
+          cause: {
+            name: "AcpJsonRpcError",
+            method,
+            rpcCode: -32000,
+            stderr: undefined,
+          },
+        });
+        expect(error).toBeInstanceOf(Error);
+        if (error instanceof Error) {
+          expect(error.message).toContain("cached-token");
+          expect(error.message).toContain("cached_token");
+          expect(error.message).not.toContain("sk-unrelated-request");
+          expect(error.message).not.toContain("api_key");
+        }
+        expect(client.stderrTail).toContain("[REDACTED]");
+        expect(client.stderrTail).not.toContain("sk-unrelated-request");
+        expect(
+          child.requests
+            .filter((message) => "method" in message)
+            .map((message) => message.method),
+        ).toEqual(["initialize", method]);
+      } finally {
+        await client.dispose();
+      }
+    },
+  );
+
+  it("does not authenticate or replay session configuration after auth_required", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/set_config_option",
+    ]);
+    const client = new AcpClient({ spawn: () => child });
+    try {
+      const pending = client.setConfigOption({
+        sessionId: "session-config-auth",
+        configId: "model",
+        value: "grok-4.5",
+      });
+      const rejection = expect(pending).rejects.toMatchObject({
+        name: "AcpJsonRpcError",
+        rpcCode: -32000,
+        method: "session/set_config_option",
+      });
+      await vi.waitFor(() =>
+        expect(
+          child.requests.some(
+            (message) =>
+              "method" in message &&
+              "id" in message &&
+              message.method === "session/set_config_option",
+          ),
+        ).toBe(true),
+      );
+      const request = child.requests.find(
+        (message) =>
+          "method" in message &&
+          "id" in message &&
+          message.method === "session/set_config_option",
+      );
+      expect(request).toBeDefined();
+      if (!request || !("id" in request)) {
+        throw new Error("Expected a session/set_config_option request.");
+      }
+      child.send({
+        jsonrpc: "2.0",
+        id: request.id,
+        error: { code: -32000, message: "Authentication required" },
+      });
+
+      await rejection;
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(
+        child.requests
+          .filter((message) => "method" in message)
+          .map((message) => message.method),
+      ).toEqual(["initialize", "session/set_config_option"]);
+    } finally {
+      await client.dispose();
+    }
+  });
+
   it("replays text-only ACP with correlated results, updates, and extensions", async () => {
     const child = new FixtureChild(readFixture("text-only.jsonl"));
     const updates: AcpSessionUpdateParams[] = [];
@@ -1468,7 +1731,7 @@ describe("AcpClient failures", () => {
     await client.dispose();
   });
 
-  it("does not turn an authentication-retry timeout into a login error", async () => {
+  it("keeps an authentication-retry timeout primary with the initial failure as its cause", async () => {
     vi.useFakeTimers();
     try {
       const child = new FixtureChild(readFixture("text-only.jsonl"), [
@@ -1480,11 +1743,7 @@ describe("AcpClient failures", () => {
         spawn: () => child,
       });
       const pending = client.newSession({ cwd: "/fixture", mcpServers: [] });
-      const rejection = expect(pending).rejects.toMatchObject({
-        name: "AcpTimeoutError",
-        code: "TIMEOUT",
-        method: "authenticate",
-      });
+      const observed = pending.catch((value: unknown) => value);
       await vi.advanceTimersByTimeAsync(0);
       const sessionRequest = child.requests.find(
         (message) => "method" in message && message.method === "session/new",
@@ -1496,14 +1755,105 @@ describe("AcpClient failures", () => {
       });
       await vi.advanceTimersByTimeAsync(25);
 
-      await rejection;
+      const error = await observed;
+      expect(error).toMatchObject({
+        name: "AcpTimeoutError",
+        code: "TIMEOUT",
+        method: "authenticate",
+        cause: expect.any(AggregateError),
+      });
+      const aggregate = (error as Error).cause as AggregateError;
+      expect(aggregate.errors).toEqual([
+        expect.objectContaining({
+          name: "AcpJsonRpcError",
+          method: "session/new",
+          rpcCode: -32000,
+        }),
+      ]);
       await client.dispose();
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("wraps an authentication JSON-RPC failure as a login error", async () => {
+  it("keeps both RPC failures when an authentication retry is rejected", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"), [
+      "session/new",
+      "authenticate",
+    ]);
+    const client = new AcpClient({ spawn: () => child });
+    try {
+      const pending = client.newSession({ cwd: "/fixture", mcpServers: [] });
+      await new Promise((resolve) => setImmediate(resolve));
+      const sessionRequest = child.requests.find(
+        (message) => "method" in message && message.method === "session/new",
+      ) as JsonRpcRequest;
+      child.send({
+        jsonrpc: "2.0",
+        id: sessionRequest.id,
+        error: { code: -32000, message: "Authentication required" },
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      const authenticateRequest = child.requests.find(
+        (message) => "method" in message && message.method === "authenticate",
+      ) as JsonRpcRequest;
+      child.send({
+        jsonrpc: "2.0",
+        id: authenticateRequest.id,
+        error: { code: -32000, message: "Cached token rejected" },
+      });
+
+      const error = await pending.catch((value: unknown) => value);
+      expect(error).toMatchObject({
+        name: "AcpAuthenticationError",
+        code: "AUTHENTICATION_FAILED",
+        cause: expect.any(AggregateError),
+      });
+      const aggregate = (error as Error).cause as AggregateError;
+      expect(aggregate.errors).toEqual([
+        expect.objectContaining({
+          name: "AcpJsonRpcError",
+          method: "session/new",
+          rpcCode: -32000,
+        }),
+        expect.objectContaining({
+          name: "AcpJsonRpcError",
+          method: "authenticate",
+          rpcCode: -32000,
+        }),
+      ]);
+    } finally {
+      await client.dispose();
+    }
+  });
+
+  it("explains how to recover when an authentication method is unavailable", async () => {
+    const child = new FixtureChild(readFixture("text-only.jsonl"));
+    const client = new AcpClient({ spawn: () => child });
+
+    try {
+      const error = await client
+        .authenticate("unsupported_method")
+        .catch((value: unknown) => value);
+
+      expect(error).toMatchObject({
+        name: "AcpAuthenticationError",
+        code: "AUTH_METHOD_NOT_AVAILABLE",
+      });
+      expect(error).toBeInstanceOf(Error);
+      if (error instanceof Error) {
+        expect(error.message).toContain("unsupported_method");
+        expect(error.message).toContain("cached_token");
+        expect(error.message).toContain("authMethod");
+        expect(error.message).not.toContain("grok login");
+        expect(error.message).not.toContain("apiKey");
+      }
+    } finally {
+      await client.dispose();
+    }
+  });
+
+  it("wraps an authentication JSON-RPC failure without provider remediation", async () => {
     const child = new FixtureChild(readFixture("text-only.jsonl"), [
       "authenticate",
     ]);
@@ -1556,7 +1906,7 @@ describe("AcpClient failures", () => {
     await client.dispose();
   });
 
-  it("wraps token-refresh failures from authenticate as login errors", async () => {
+  it("wraps token-refresh internal errors from authenticate", async () => {
     const child = new FixtureChild(readFixture("text-only.jsonl"), [
       "authenticate",
     ]);
@@ -1575,7 +1925,13 @@ describe("AcpClient failures", () => {
     await expect(pending).rejects.toMatchObject({
       name: "AcpAuthenticationError",
       code: "AUTHENTICATION_FAILED",
-      cause: { rpcCode: -32603, rpcMessage: "token refresh failed" },
+      cause: {
+        name: "AcpJsonRpcError",
+        code: "JSON_RPC_ERROR",
+        rpcCode: -32603,
+        rpcMessage: "token refresh failed",
+        method: "authenticate",
+      },
     });
     await client.dispose();
   });
@@ -1603,6 +1959,7 @@ describe("AcpClient failures", () => {
       name: "AcpProcessExitError",
       code: "PROCESS_EXIT",
       exitCode: 17,
+      cause: expect.any(AggregateError),
     });
     expect(client.failure?.name).not.toBe("AcpAuthenticationError");
   });

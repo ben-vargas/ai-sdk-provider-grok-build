@@ -25,7 +25,7 @@ grok login
 npm install ai@^7 ai-sdk-provider-grok-build zod@^4
 ```
 
-Cached CLI authentication is the default. For CI, set `apiKey` or `XAI_API_KEY`.
+Cached CLI authentication is the default. For CI, either set the provider `apiKey` option, or set `authMethod: "api_key"` and provide `XAI_API_KEY` through `env` or the process environment. `XAI_API_KEY` alone does not change the ACP authentication method.
 
 The provider resolves the CLI in this order:
 
@@ -147,6 +147,8 @@ Shared process settings are available in every mode:
 
 ACP settings additionally include `authMethod`, `reasoningEffort`, `mcpServers`, `includeRawChunks`, `permissionMode`, `alwaysApprove`, `dangerouslySkipPermissions`, `onPermissionRequest`, and filesystem handlers.
 
+The `apiKey` setting selects API-key authentication automatically. When the key comes from `env.XAI_API_KEY` or the process environment instead, select it explicitly with `authMethod: "api_key"`; otherwise ACP continues to use its default `cached_token` method.
+
 `createGrokAgent` also accepts `maxClients`, a positive integer that defaults to `8`. ACP response validation happens before initialization or session state is cached. Select configuration options may be flat or grouped; boolean and future option kinds are retained without being mistaken for model selectors.
 
 Exec settings additionally include:
@@ -210,7 +212,7 @@ ACP permission requests fail closed when no callback is installed. Only explicit
 
 Abort and stream cancellation preserve the caller's reason, cancel the ACP session or terminate the headless child, and use bounded escalation so orphan processes are not left behind. Tool side effects already started by Grok cannot be rolled back.
 
-Automatic retries are limited to failures proven to happen before prompt dispatch. ACP timeouts/process exits and generic JSON-RPC internal error `-32603` are retryable only before dispatch. Authentication-required `-32000` and credential-specific `-32603` responses (for example, token-refresh failures), missing-resource `-32002`, cancellation, prompt timeouts, missing terminal records, non-zero headless exits, explicit headless error events, and all post-dispatch failures are non-retryable because a tool side effect may already have occurred.
+Automatic retries are limited to failures proven to happen before prompt dispatch. ACP timeouts/process exits and generic JSON-RPC internal error `-32603` are retryable only before dispatch. Authentication-required `-32000` is the canonical, method-independent credential signal. For compatibility with older Grok responses, `-32603` is also treated as a non-retryable credential failure only when an anchored authentication diagnostic comes from `authenticate`, `initialize`, `session/new`, `session/load`, or `session/set_config_option`; authentication-looking prompt and unknown-method internal errors are not promoted. Missing-resource `-32002`, cancellation, prompt timeouts, missing terminal records, non-zero headless exits, explicit headless error events, and all post-dispatch failures are non-retryable because a tool side effect may already have occurred.
 
 ## Prompt and media behavior
 

@@ -1,5 +1,9 @@
 import { AISDKError, APICallError, LoadAPIKeyError } from "@ai-sdk/provider";
 import {
+  grokAuthenticationRemediation,
+  JSON_RPC_INTERNAL_ERROR_CODE,
+} from "./acp/authentication.js";
+import {
   AcpAuthenticationError,
   AcpError,
   AcpJsonRpcError,
@@ -7,6 +11,8 @@ import {
   AcpSpawnError,
   AcpTimeoutError,
   isAcpAuthenticationRpcError,
+  sanitizeDiagnosticMessage,
+  stderrTail,
   stripAnsiEscapeSequences,
 } from "./acp/errors.js";
 
@@ -33,18 +39,83 @@ export class GrokCliError extends Error {
       stderr?: string;
     },
   ) {
-    super(message, { cause: options.cause });
+    super(
+      options.code === "GROK_CLI_HEADLESS_ERROR"
+        ? sanitizeDiagnosticMessage(message)
+        : message,
+      { cause: options.cause },
+    );
     this.name = "GrokCliError";
     this.code = options.code;
     this.exitCode = options.exitCode;
-    this.stderr = options.stderr;
+    const sanitizedStderr = options.stderr ? stderrTail(options.stderr) : "";
+    this.stderr = sanitizedStderr || undefined;
   }
 }
 
 export function createGrokBuildAuthenticationError(
   message: string,
+  cause?: unknown,
 ): LoadAPIKeyError {
-  return new LoadAPIKeyError({ message });
+  const error = new LoadAPIKeyError({ message });
+  if (cause !== undefined) {
+    Object.defineProperty(error, "cause", {
+      configurable: true,
+      enumerable: true,
+      value: cause,
+      writable: true,
+    });
+  }
+  return error;
+}
+
+function collectAuthenticationDiagnostics(error: Error): string[] {
+  const diagnostics: string[] = [];
+  const pending: unknown[] = [error];
+  const seen = new Set<unknown>();
+  while (pending.length > 0 && diagnostics.length < 4) {
+    const current = pending.shift();
+    if (!(current instanceof Error) || seen.has(current)) continue;
+    seen.add(current);
+    if (current instanceof AggregateError) {
+      pending.unshift(...current.errors);
+      if (current.cause !== undefined) pending.push(current.cause);
+      continue;
+    }
+    const diagnostic = sanitizeDiagnosticMessage(current.message);
+    if (
+      diagnostic &&
+      !diagnostics.some(
+        (existing) =>
+          existing === diagnostic ||
+          existing.includes(diagnostic) ||
+          diagnostic.includes(existing),
+      )
+    ) {
+      diagnostics.push(diagnostic);
+    }
+    if (current.cause !== undefined) pending.push(current.cause);
+  }
+  return diagnostics;
+}
+
+function formatAcpAuthenticationError(
+  error: AcpError,
+  authenticationMode: string,
+): string {
+  const details = collectAuthenticationDiagnostics(error);
+  const errorCode = error.code;
+  if (errorCode && !details.some((detail) => detail.includes(errorCode))) {
+    details.push(`Provider error code: ${errorCode}.`);
+  }
+  const tail = error.stderr ? stderrTail(error.stderr) : "";
+  if (tail && !details.some((detail) => detail.includes(tail))) {
+    details.push(`Stderr tail: ${tail}`);
+  }
+  return `${details.join("\n")}\n\n${grokAuthenticationRemediation(
+    authenticationMode,
+    error.code,
+  )}`;
 }
 
 const STRONG_AUTHENTICATION_FAILURE_DIAGNOSTICS = [
@@ -137,7 +208,7 @@ function containsAuthenticationFailureDiagnostic(
 export function mapAcpError(
   error: unknown,
   requestBodyValues?: unknown,
-  options: { postDispatch?: boolean } = {},
+  options: { authenticationMode?: string; postDispatch?: boolean } = {},
 ): Error {
   if (AISDKError.isInstance(error)) {
     return error;
@@ -149,10 +220,22 @@ export function mapAcpError(
     return error;
   }
   if (error instanceof AcpAuthenticationError) {
-    return createGrokBuildAuthenticationError(error.message);
+    return createGrokBuildAuthenticationError(
+      formatAcpAuthenticationError(
+        error,
+        options.authenticationMode ?? "cached_token",
+      ),
+      error,
+    );
   }
   if (isAcpAuthenticationRpcError(error)) {
-    return createGrokBuildAuthenticationError(error.message);
+    return createGrokBuildAuthenticationError(
+      formatAcpAuthenticationError(
+        error,
+        options.authenticationMode ?? "cached_token",
+      ),
+      error,
+    );
   }
 
   const acpError = error instanceof AcpError ? error : undefined;
@@ -175,8 +258,7 @@ export function mapAcpError(
     (error instanceof AcpTimeoutError ||
       error instanceof AcpProcessExitError ||
       (error instanceof AcpJsonRpcError &&
-        error.rpcCode === -32603 &&
-        !isAcpAuthenticationRpcError(error)));
+        error.rpcCode === JSON_RPC_INTERNAL_ERROR_CODE));
 
   return new APICallError({
     message:
@@ -211,7 +293,7 @@ export function mapGrokExecError(
     ) &&
     containsAuthenticationFailureDiagnostic(message, cliError.stderr ?? "");
   if (authenticationFailure) {
-    return createGrokBuildAuthenticationError(message);
+    return createGrokBuildAuthenticationError(message, error);
   }
   return new APICallError({
     message,

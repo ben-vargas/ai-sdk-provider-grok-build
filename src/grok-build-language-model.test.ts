@@ -25,6 +25,7 @@ import {
   buildAcpCommandArgs,
   GrokBuildLanguageModel,
 } from "./grok-build-language-model.js";
+import type { GrokBuildSettings } from "./settings.js";
 
 interface FixtureRow {
   dir: "in" | "out" | "stderr";
@@ -247,6 +248,103 @@ describe("GrokBuildLanguageModel", () => {
       alwaysApprove: true,
       env: { XAI_API_BASE_URL: "https://api.example.test" },
     });
+  });
+
+  it.each([
+    {
+      label: "the provider apiKey option",
+      settings: { cwd: "/fixture", apiKey: "provider-key" },
+      expectedAuthMethod: false,
+      expectedApiKey: "provider-key",
+    },
+    {
+      label: "an explicit api_key method with an environment key",
+      settings: {
+        cwd: "/fixture",
+        authMethod: "api_key",
+        env: { XAI_API_KEY: "environment-key" },
+      },
+      expectedAuthMethod: false,
+      expectedApiKey: "environment-key",
+    },
+    {
+      label: "an environment key without an explicit method",
+      settings: {
+        cwd: "/fixture",
+        env: { XAI_API_KEY: "environment-key" },
+      },
+      expectedAuthMethod: "cached_token",
+      expectedApiKey: "environment-key",
+    },
+  ] satisfies Array<{
+    label: string;
+    settings: GrokBuildSettings;
+    expectedAuthMethod: string | false;
+    expectedApiKey: string;
+  }>)(
+    "resolves ACP authentication for $label",
+    async ({ settings, expectedAuthMethod, expectedApiKey }) => {
+      const child = new FixtureChild(readFixture("text-only.jsonl"));
+      let captured: AcpClientOptions | undefined;
+      const model = new GrokBuildLanguageModel({
+        id: "grok-4.5",
+        settings,
+        clientFactory: (options) => {
+          captured = options;
+          return new AcpClient({
+            ...options,
+            authMethod: false,
+            spawn: () => child,
+          });
+        },
+      });
+
+      await model.doGenerate(promptOptions("ping"));
+
+      expect(captured?.authMethod).toBe(expectedAuthMethod);
+      expect(captured?.env?.XAI_API_KEY).toBe(expectedApiKey);
+    },
+  );
+
+  it("requires explicit api_key mode for a process-environment key", async () => {
+    const previousApiKey = process.env.XAI_API_KEY;
+    process.env.XAI_API_KEY = "process-key";
+    const captureOptions = async (
+      settings: GrokBuildSettings,
+    ): Promise<AcpClientOptions> => {
+      const child = new FixtureChild(readFixture("text-only.jsonl"));
+      let captured: AcpClientOptions | undefined;
+      const model = new GrokBuildLanguageModel({
+        id: "grok-4.5",
+        settings,
+        clientFactory: (options) => {
+          captured = options;
+          return new AcpClient({
+            ...options,
+            authMethod: false,
+            spawn: () => child,
+          });
+        },
+      });
+      await model.doGenerate(promptOptions("ping"));
+      if (!captured) throw new Error("Expected captured ACP client options.");
+      return captured;
+    };
+
+    try {
+      const cached = await captureOptions({ cwd: "/fixture" });
+      expect(cached.authMethod).toBe("cached_token");
+
+      const apiKey = await captureOptions({
+        cwd: "/fixture",
+        authMethod: "api_key",
+      });
+      expect(apiKey.authMethod).toBe(false);
+      expect(apiKey.env?.XAI_API_KEY).toBe("process-key");
+    } finally {
+      if (previousApiKey === undefined) delete process.env.XAI_API_KEY;
+      else process.env.XAI_API_KEY = previousApiKey;
+    }
   });
 
   it.skipIf(process.platform === "win32")(
@@ -615,6 +713,93 @@ describe("GrokBuildLanguageModel", () => {
     const error = await pending.catch((value: unknown) => value);
     expect(error).toBeInstanceOf(LoadAPIKeyError);
   });
+
+  it.each([
+    {
+      label: "cached-token mode",
+      settings: { cwd: "/fixture" },
+      expectedAdvice: "grok login",
+      unexpectedAdvice: "Verify or replace the provider 'apiKey' value",
+    },
+    {
+      label: "API-key mode",
+      settings: { cwd: "/fixture", apiKey: "provider-key" },
+      expectedAdvice: "Verify or replace the provider 'apiKey' value",
+      unexpectedAdvice: "grok login",
+    },
+  ] satisfies Array<{
+    label: string;
+    settings: GrokBuildSettings;
+    expectedAdvice: string;
+    unexpectedAdvice: string;
+  }>)(
+    "preserves an empty-method session authentication failure at the model boundary in $label",
+    async ({ settings, expectedAdvice, unexpectedAdvice }) => {
+      const child = new FixtureChild(readFixture("config-options-1x.jsonl"), [
+        "session/new",
+      ]);
+      const model = new GrokBuildLanguageModel({
+        id: "grok-4.5",
+        settings,
+        clientFactory: (options) =>
+          new AcpClient({ ...options, spawn: () => child }),
+      });
+      const pending = model.doStream(promptOptions("ping"));
+      void pending.catch(() => undefined);
+      await vi.waitFor(() => {
+        expect(
+          child.requests.filter(
+            (request) =>
+              "method" in request && request.method === "session/new",
+          ),
+        ).toHaveLength(1);
+      });
+      const sessionRequest = child.requests.find(
+        (request): request is JsonRpcRequest =>
+          "method" in request &&
+          "id" in request &&
+          request.method === "session/new",
+      );
+      expect(sessionRequest).toBeDefined();
+      if (!sessionRequest) throw new Error("Expected a session/new request.");
+      child.send({
+        jsonrpc: "2.0",
+        id: sessionRequest.id,
+        error: { code: -32603, message: "token refresh failed" },
+      });
+
+      const error = await pending.catch((value: unknown) => value);
+      expect(error).toBeInstanceOf(LoadAPIKeyError);
+      expect(error).toBeInstanceOf(Error);
+      if (error instanceof Error) {
+        expect(error.message).toContain("session/new");
+        expect(error.message).toContain("-32603");
+        expect(error.message).toContain("token refresh failed");
+        expect(error.message).toContain(
+          "Provider error code: AUTHENTICATION_FAILED.",
+        );
+        expect(error.message).toContain(expectedAdvice);
+        expect(error.message).not.toContain(unexpectedAdvice);
+        expect(error.message).toContain("authMethod");
+        expect(error.message).toContain("api_key");
+        expect(error.message).toContain("XAI_API_KEY");
+        expect(error.cause).toMatchObject({
+          name: "AcpAuthenticationError",
+          code: "AUTHENTICATION_FAILED",
+          cause: {
+            name: "AcpJsonRpcError",
+            method: "session/new",
+            rpcCode: -32603,
+          },
+        });
+      }
+      expect(
+        child.requests
+          .filter((request) => "method" in request)
+          .map((request) => request.method),
+      ).toEqual(["initialize", "session/new"]);
+    },
+  );
 
   it("maps malformed ACP JSON at the model boundary and terminates the agent", async () => {
     const { model, child } = fixtureModel("text-only.jsonl", false, [

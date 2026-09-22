@@ -15,6 +15,7 @@ import {
   AcpSpawnError,
   AcpTimeoutError,
   isAcpAuthenticationRpcError,
+  stderrTail,
 } from "./errors.js";
 import type {
   AcpAgentRequestMap,
@@ -308,6 +309,47 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function isAdvertisedAuthMethod(
+  initialized: AcpInitializeResult,
+  methodId: string,
+): boolean {
+  return initialized.authMethods.some((method) => method.id === methodId);
+}
+
+function authMethodNotAvailableError(
+  initialized: AcpInitializeResult,
+  methodId: string,
+  cause?: unknown,
+): AcpAuthenticationError {
+  const message =
+    initialized.authMethods.length === 0
+      ? `Grok did not advertise authentication method '${methodId}' and advertised no authentication methods.`
+      : `Grok did not advertise authentication method '${methodId}'. Available methods: ${initialized.authMethods.map((method) => method.id).join(", ")}. Configure 'authMethod' to one of the advertised methods.`;
+  return new AcpAuthenticationError(message, {
+    cause,
+    code: "AUTH_METHOD_NOT_AVAILABLE",
+  });
+}
+
+function attachAuthenticationRetryCause(
+  retryError: unknown,
+  initialError: AcpJsonRpcError,
+): unknown {
+  if (!(retryError instanceof Error)) return retryError;
+  const causes: unknown[] = [initialError];
+  if (retryError.cause !== undefined) causes.push(retryError.cause);
+  Object.defineProperty(retryError, "cause", {
+    configurable: true,
+    enumerable: true,
+    value: new AggregateError(
+      causes,
+      "ACP authentication retry failed after the initial session authentication failure.",
+    ),
+    writable: true,
+  });
+  return retryError;
+}
+
 function sessionIdFromParams(params: unknown): string | undefined {
   return isRecord(params) &&
     typeof params.sessionId === "string" &&
@@ -418,7 +460,7 @@ export class AcpClient {
   }
 
   get stderrTail(): string {
-    return this.stderr;
+    return stderrTail(this.stderr);
   }
 
   get failure(): Error | undefined {
@@ -554,15 +596,8 @@ export class AcpClient {
   ): Promise<AcpAuthenticateResult> {
     if (methodId === false) return {};
     const initialized = await this.initialize(signal);
-    const advertised = initialized.authMethods.some(
-      (method) => method.id === methodId,
-    );
-    if (!advertised) {
-      throw new AcpAuthenticationError(
-        `Grok did not advertise authentication method '${methodId}'. Available methods: ${initialized.authMethods.map((method) => method.id).join(", ") || "(none)"}.`,
-        { stderr: this.stderr, code: "AUTH_METHOD_NOT_AVAILABLE" },
-      );
-    }
+    if (!isAdvertisedAuthMethod(initialized, methodId))
+      throw authMethodNotAvailableError(initialized, methodId);
     try {
       return await this.requestInternal(
         "authenticate",
@@ -573,8 +608,8 @@ export class AcpClient {
     } catch (error) {
       if (isAcpAuthenticationRpcError(error)) {
         throw new AcpAuthenticationError(
-          `Grok authentication with method '${methodId}' failed. Run 'grok login' to refresh the cached CLI login, or configure XAI_API_KEY as an alternative.`,
-          { cause: error, stderr: this.stderr, code: "AUTHENTICATION_FAILED" },
+          `Grok authentication with method '${methodId}' failed.\n${error.message}`,
+          { cause: error, code: "AUTHENTICATION_FAILED" },
         );
       }
       throw error;
@@ -612,13 +647,7 @@ export class AcpClient {
         signal,
       );
     } catch (error) {
-      if (isAcpAuthenticationRpcError(error)) {
-        throw new AcpAuthenticationError(
-          "Grok requires authentication. Run 'grok login' for cached subscription authentication or configure XAI_API_KEY.",
-          { cause: error, stderr: this.stderr },
-        );
-      }
-      throw error;
+      throw this.withNewSessionAuthenticationContext(error);
     }
   }
 
@@ -808,7 +837,7 @@ export class AcpClient {
     params: AcpRequestMap[Method]["params"],
     signal?: AbortSignal,
   ): Promise<AcpRequestMap[Method]["result"]> {
-    await this.initialize(signal);
+    const initialized = await this.initialize(signal);
     try {
       return await this.requestInternal(
         method,
@@ -819,7 +848,21 @@ export class AcpClient {
     } catch (error) {
       if (!isAcpAuthenticationRpcError(error) || this.authMethod === false)
         throw error;
-      await this.authenticate(this.authMethod, signal);
+      if (!isAdvertisedAuthMethod(initialized, this.authMethod)) {
+        if (initialized.authMethods.length > 0) {
+          throw authMethodNotAvailableError(
+            initialized,
+            this.authMethod,
+            error,
+          );
+        }
+        throw error;
+      }
+      try {
+        await this.authenticate(this.authMethod, signal);
+      } catch (retryError) {
+        throw attachAuthenticationRetryCause(retryError, error);
+      }
       return await this.requestInternal(
         method,
         params,
@@ -827,6 +870,14 @@ export class AcpClient {
         signal,
       );
     }
+  }
+
+  private withNewSessionAuthenticationContext(error: unknown): unknown {
+    if (!isAcpAuthenticationRpcError(error)) return error;
+    return new AcpAuthenticationError(
+      `Grok requires authentication.\n${error.message}`,
+      { cause: error },
+    );
   }
 
   private async disposeInternal(): Promise<void> {
@@ -1163,9 +1214,7 @@ export class AcpClient {
         reject,
         timer: setTimeout(() => {
           this.settlePendingRequest(id, pending, () => {
-            reject(
-              new AcpTimeoutError(method, timeoutMs, { stderr: this.stderr }),
-            );
+            reject(new AcpTimeoutError(method, timeoutMs));
           });
         }, timeoutMs),
         cleanup: cleanupAbort,
@@ -1315,9 +1364,7 @@ export class AcpClient {
 
     if ("error" in record) {
       const failure = record as unknown as JsonRpcFailure;
-      const error = new AcpJsonRpcError(pending.method, failure.error, {
-        stderr: this.stderr,
-      });
+      const error = new AcpJsonRpcError(pending.method, failure.error);
       const callbackBarrier = this.responseCallbackBarrier(pending, undefined);
       void callbackBarrier.then(() => {
         this.settlePendingRequest(id, pending, () => pending.reject(error));
